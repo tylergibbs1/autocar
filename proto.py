@@ -910,11 +910,11 @@ class IntersectionSimulation:
             approach_counts[vehicle.approach_angle] += 1
         
         # Spawn new vehicles if any direction has too few cars
-        min_per_direction = 1  # Minimum vehicles per direction
+        min_per_direction = 3  # Minimum vehicles per direction - increased from 2
         import random
         
         # Always maintain at least some vehicles in the simulation
-        if len(self.vehicles) < 4:  # If we have fewer than 4 total vehicles
+        if len(self.vehicles) < 12:  # If we have fewer than 12 total vehicles - increased from 8
             # Force spawn from a random direction
             directions = [0, 90, 180, 270]
             for direction in directions:
@@ -926,9 +926,16 @@ class IntersectionSimulation:
             for approach_angle, count in approach_counts.items():
                 if count < min_per_direction and len(self.vehicles) < self.max_vehicles:
                     # Higher chance to spawn if we're below minimum
-                    spawn_chance = 0.1 if count == 0 else 0.05  # 10% if none, 5% if below min
+                    spawn_chance = 0.25 if count == 0 else 0.15  # 25% if none, 15% if below min
                     if random.random() < spawn_chance:
                         self.spawn_new_vehicle(approach_angle)
+            
+            # Additional spawning to maintain high traffic density
+            if len(self.vehicles) < self.max_vehicles * 0.8:  # If below 80% capacity
+                for approach_angle in [0, 90, 180, 270]:
+                    if approach_counts[approach_angle] < 4 and len(self.vehicles) < self.max_vehicles:
+                        if random.random() < 0.08:  # 8% chance per direction
+                            self.spawn_new_vehicle(approach_angle)
 
     def check_visual_collisions_realtime(self):
         """Real-time collision detection matching visual representation"""
@@ -1259,31 +1266,25 @@ class IntersectionSimulation:
         
         # Update vehicle states
         for i, vehicle in enumerate(self.vehicles):
-            accel = safe_accels_cpu[i]
-            
-            # Check if vehicle is in intersection
-            inside_intersection = self._inside_box(vehicle.x, vehicle.y)
-            
-            # Prevent complete stops in intersection
-            if inside_intersection:
-                # Force minimum speed in intersection to prevent deadlock
-                min_intersection_speed = 3.0  # m/s minimum speed in intersection
-                if vehicle.velocity < min_intersection_speed:
-                    # Override with gentle acceleration to maintain flow
-                    accel = max(accel, 1.0)  # Minimum 1.0 m/s² acceleration in intersection
-                    print(f"V{vehicle.id}: Preventing intersection stop - forcing acceleration {accel:.2f}")
+            # Handle case where new vehicles were spawned during this step
+            if i >= len(safe_accels_cpu):
+                accel = 0.0  # New vehicles start with zero acceleration
+            else:
+                accel = safe_accels_cpu[i]
             
             # Update velocity
             vehicle.velocity += accel * self.dt
             
-            # Special handling for intersection vehicles
+            # Check if vehicle is in intersection after velocity update
+            inside_intersection = self._inside_box(vehicle.x, vehicle.y)
+            
+            # Apply speed limits based on location
             if inside_intersection:
-                # Ensure minimum speed in intersection
-                vehicle.velocity = max(vehicle.velocity, 2.0)  # Never go below 2 m/s in intersection
-                # Cap maximum speed to prevent dangerous speeds
+                # In intersection: prevent complete stops but allow natural deceleration
+                vehicle.velocity = max(vehicle.velocity, 1.0)  # Reduced minimum from 2.0 to 1.0
                 vehicle.velocity = min(vehicle.velocity, vehicle.target_velocity * 1.2)
             else:
-                # Normal speed limits outside intersection
+                # Outside intersection: normal speed limits
                 vehicle.velocity = np.clip(vehicle.velocity, 0, vehicle.target_velocity * 1.5)
             
             # Sanity check for negative speeds
@@ -1298,6 +1299,11 @@ class IntersectionSimulation:
                 # vehicle was inside this step and is now out of the box => completed a crossing
                 self.metrics['completed'] += 1
                 self._has_completed[vehicle.id] = True
+                
+                # Immediately spawn a new vehicle in the same direction
+                if len(self.vehicles) < self.max_vehicles:
+                    self.spawn_new_vehicle(vehicle.approach_angle)
+                    print(f"V{vehicle.id} completed intersection - spawning new vehicle from {vehicle.approach_angle}°")
             # update prev flag for the next frame
             self._inside_box_prev[vehicle.id] = inside_after
             
@@ -1321,7 +1327,7 @@ class IntersectionSimulation:
         self.visual_collision_pairs = visual_collision_pairs
         
         # Manage vehicle population (respawn/despawn)
-        if self.current_step % 10 == 0:  # Every 10 steps (~1 second)
+        if self.current_step % 5 == 0:  # Every 5 steps (~0.5 seconds) - increased frequency
             self.manage_vehicle_population()
         
         self.current_step += 1
@@ -1391,8 +1397,25 @@ class IntersectionSimulation:
         self.ax_speed.set_xlabel('Time (s)')
         self.ax_speed.set_ylabel('Speed (m/s)')
         
-        # Initialize vehicle visualizations
-        self.colors = ['#00aaff', '#ff4444', '#44ff44', '#ffaa00', '#aa44ff', '#ff8844', '#ff44aa', '#44ffff'] * 10
+        # Initialize vehicle visualizations with more diverse colors
+        self.colors = [
+            '#00aaff',  # Blue
+            '#ff4444',  # Red  
+            '#44ff44',  # Green
+            '#ffaa00',  # Orange
+            '#aa44ff',  # Purple
+            '#ff8844',  # Orange-red
+            '#ff44aa',  # Pink
+            '#44ffff',  # Cyan
+            '#88ff44',  # Lime
+            '#ff4488',  # Rose
+            '#44aaff',  # Light blue
+            '#ffaa44',  # Gold
+            '#aa88ff',  # Lavender
+            '#44ff88',  # Mint
+            '#ff8888',  # Light red
+            '#88aaff'   # Periwinkle
+        ] * 2  # Duplicate for more vehicles
         
         for i, vehicle in enumerate(self.vehicles):
             self._setup_vehicle_visualization(vehicle, i)
@@ -1410,7 +1433,11 @@ class IntersectionSimulation:
     def _setup_vehicle_visualization(self, vehicle: VehicleState, color_index: int = None):
         """Setup visualization elements for a single vehicle"""
         if color_index is None:
-            color_index = len(self.vehicle_shapes)
+            # Better color assignment: base on vehicle ID and approach angle for variety
+            base_color_index = (vehicle.id - 1) % len(self.colors)
+            # Add some variation based on approach angle to spread colors better
+            angle_offset = {0: 0, 90: 2, 180: 4, 270: 6}.get(vehicle.approach_angle, 0)
+            color_index = (base_color_index + angle_offset) % len(self.colors)
         
         color = self.colors[color_index % len(self.colors)]
         vehicle.color = color
@@ -1640,8 +1667,8 @@ class IntersectionSimulation:
         s = p[:, None] - p[None, :]           # [B,B]
         vrel = v[:, None] - v[None, :]        # [B,B]
 
-        d_safe = 12.0
-        alpha = 0.5
+        d_safe = 8.0  # Reduced from 12.0 to allow closer following
+        alpha = 0.3   # Reduced from 0.5 for less aggressive safety
         dt = self.dt
 
         # one-step linearized bound (as in your scalar CBF)
@@ -1680,18 +1707,26 @@ def create_scenario(device_override=None):
     global device
     if device_override:
         device = device_override
-    sim = IntersectionSimulation(max_vehicles=8)
+    sim = IntersectionSimulation(max_vehicles=16)
     
     # Assign priorities and safe initial positions to prevent immediate collisions
     vehicles = [
         VehicleState(1, np.array([-80.0, 0.0]), 12.0, 20.0, 0, 0, 0.8),   # North approach - increased from 15.0
         VehicleState(2, np.array([-120.0, 0.0]), 11.0, 20.0, 0, 0, 0.6),  # North approach, further back - increased from 15.0
-        VehicleState(3, np.array([85.0, 0.0]), 13.0, 20.0, 180, 0, 0.7),  # South approach - increased from 15.0
-        VehicleState(4, np.array([125.0, 0.0]), 12.0, 20.0, 180, 0, 0.5), # South approach, further back - increased from 15.0
-        VehicleState(5, np.array([0.0, -75.0]), 10.0, 20.0, 90, 0, 0.9),  # East approach - increased from 15.0
-        VehicleState(6, np.array([0.0, -115.0]), 11.0, 20.0, 90, 0, 0.4), # East approach, further back - increased from 15.0
-        VehicleState(7, np.array([0.0, 80.0]), 9.0, 20.0, 270, 0, 0.3),   # West approach - increased from 15.0
-        VehicleState(8, np.array([0.0, 120.0]), 10.0, 20.0, 270, 0, 0.2), # West approach, furthest back - increased from 15.0
+        VehicleState(3, np.array([-160.0, 0.0]), 10.0, 20.0, 0, 0, 0.4),  # North approach, even further back
+        VehicleState(4, np.array([-200.0, 0.0]), 9.0, 20.0, 0, 0, 0.7),   # North approach, furthest back
+        VehicleState(5, np.array([85.0, 0.0]), 13.0, 20.0, 180, 0, 0.7),  # South approach - increased from 15.0
+        VehicleState(6, np.array([125.0, 0.0]), 12.0, 20.0, 180, 0, 0.5), # South approach, further back - increased from 15.0
+        VehicleState(7, np.array([165.0, 0.0]), 11.0, 20.0, 180, 0, 0.3), # South approach, even further back
+        VehicleState(8, np.array([205.0, 0.0]), 10.0, 20.0, 180, 0, 0.6), # South approach, furthest back
+        VehicleState(9, np.array([0.0, -75.0]), 10.0, 20.0, 90, 0, 0.9),  # East approach - increased from 15.0
+        VehicleState(10, np.array([0.0, -115.0]), 11.0, 20.0, 90, 0, 0.4), # East approach, further back - increased from 15.0
+        VehicleState(11, np.array([0.0, -155.0]), 12.0, 20.0, 90, 0, 0.8), # East approach, even further back
+        VehicleState(12, np.array([0.0, -195.0]), 9.0, 20.0, 90, 0, 0.5),  # East approach, furthest back
+        VehicleState(13, np.array([0.0, 80.0]), 9.0, 20.0, 270, 0, 0.3),   # West approach - increased from 15.0
+        VehicleState(14, np.array([0.0, 120.0]), 10.0, 20.0, 270, 0, 0.2), # West approach, furthest back - increased from 15.0
+        VehicleState(15, np.array([0.0, 160.0]), 11.0, 20.0, 270, 0, 0.6), # West approach, even further back
+        VehicleState(16, np.array([0.0, 200.0]), 8.0, 20.0, 270, 0, 0.9),  # West approach, furthest back
     ]
     
     for vehicle in vehicles:
@@ -1704,7 +1739,7 @@ if __name__ == "__main__":
     print("High-Performance Intersection Control")
     
     # Update device selection based on actual workload
-    max_vehicles = 8  # From create_scenario
+    max_vehicles = 16  # From create_scenario - doubled
     horizon = 15
     device = pick_device(max_vehicles, horizon)
     print(f"Device selected: {device} (workload: {max_vehicles}×{horizon}={max_vehicles*horizon})")
