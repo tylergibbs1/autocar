@@ -1368,17 +1368,17 @@ class IntersectionSimulation:
         for direction in ['north', 'south', 'east', 'west']:
             if direction in ['north', 'south']:
                 if direction == 'north':
-                    road = Rectangle((-self.lane_width/2, 0), self.lane_width/2, road_length,
+                    road = Rectangle((-self.lane_width/2, 0), self.lane_width, road_length,
                                    fill=True, facecolor='#505060', alpha=0.7)
                 else:
-                    road = Rectangle((0, -road_length), self.lane_width/2, road_length,
+                    road = Rectangle((-self.lane_width/2, -road_length), self.lane_width, road_length,
                                    fill=True, facecolor='#505060', alpha=0.7)
             else:
                 if direction == 'east':
-                    road = Rectangle((0, -self.lane_width/2), road_length, self.lane_width/2,
+                    road = Rectangle((0, -self.lane_width/2), road_length, self.lane_width,
                                    fill=True, facecolor='#505060', alpha=0.7)
                 else:
-                    road = Rectangle((-road_length, 0), road_length, self.lane_width/2,
+                    road = Rectangle((-road_length, -self.lane_width/2), road_length, self.lane_width,
                                    fill=True, facecolor='#505060', alpha=0.7)
             self.ax_main.add_patch(road)
         
