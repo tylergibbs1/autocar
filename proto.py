@@ -143,13 +143,10 @@ class BatchedMPCController:
         self.control_batch = torch.zeros((self.max_vehicles, self.horizon), 
                                         device=device, dtype=torch.float32)
         
-        # Initialize CUDA streams for concurrent execution
-        if device.type == 'cuda':
-            self.compute_stream = torch.cuda.Stream()
-            self.transfer_stream = torch.cuda.Stream()
-        else:
-            self.compute_stream = None
-            self.transfer_stream = None
+        # Remove unused CUDA streams - they weren't properly synchronized
+        # and caused potential memory corruption issues
+        self.compute_stream = None
+        self.transfer_stream = None
     
     def encode_states_batch(self, vehicles: List[VehicleState], time_step: int) -> torch.Tensor:
         """Vectorized state encoding with single CPU→GPU transfer"""
@@ -186,11 +183,8 @@ class BatchedMPCController:
             start = 3 + 3 * (self.max_vehicles - 1)
             state_cpu[i, start:start+2] = time_feats
 
-        # Single nonblocking copy into prealloc GPU buffer
-        if device.type == 'cuda':
-            state_gpu = torch.from_numpy(state_cpu).pin_memory().to(device, non_blocking=True)
-        else:
-            state_gpu = torch.from_numpy(state_cpu).to(device)
+        # Transfer to GPU (removed non_blocking due to removed stream synchronization)
+        state_gpu = torch.from_numpy(state_cpu).to(device)
         # Put into our pre-allocated batch to keep shapes stable for TorchScript etc.
         with torch.no_grad():
             self.state_batch[:batch_size].copy_(state_gpu)
@@ -443,19 +437,12 @@ class BatchedMPCController:
         # Debug assertions to catch shape mismatches
         assert batch_size <= self.max_vehicles, f"Batch size {batch_size} exceeds max {self.max_vehicles}"
         
-        # Use compute stream for main computation
-        if self.compute_stream is not None:
-            with torch.cuda.stream(self.compute_stream):
-                state_batch = self.encode_states_batch(vehicles, time_step)
-                
-                # Neural network prediction - inference only, no gradients needed
-                with torch.inference_mode():
-                    control_pred_batch = self.neural_mpc(state_batch)
-        else:
-            state_batch = self.encode_states_batch(vehicles, time_step)
-            # Neural network prediction - inference only, no gradients needed
-            with torch.inference_mode():
-                control_pred_batch = self.neural_mpc(state_batch)
+        # Encode states and run neural network prediction
+        state_batch = self.encode_states_batch(vehicles, time_step)
+        
+        # Neural network prediction - inference only, no gradients needed
+        with torch.inference_mode():
+            control_pred_batch = self.neural_mpc(state_batch)
         
         # Predictive gradient descent for collision avoidance
         control_batch = control_pred_batch.clone().detach()
@@ -528,12 +515,14 @@ class BatchedMPCController:
         # Update planned trajectories (final forward pass) - no gradients needed
         with torch.inference_mode():
             final_trajectories = self.predict_trajectories_batch(control_batch, vehicles)
-            # Keep trajectories on GPU, only transfer when needed for visualization
+            # Always store as CPU numpy arrays to avoid GPU memory management issues
             for i, vehicle in enumerate(vehicles):
+                # Properly transfer to CPU with synchronization
+                trajectory_cpu = final_trajectories[i].cpu().numpy()
+                vehicle.planned_trajectory = trajectory_cpu
+                # Remove any existing GPU trajectory references
                 if hasattr(vehicle, '_gpu_trajectory'):
-                    vehicle._gpu_trajectory = final_trajectories[i]
-                else:
-                    vehicle.planned_trajectory = final_trajectories[i].cpu().numpy()
+                    delattr(vehicle, '_gpu_trajectory')
         
         # NO MORE torch.cuda.synchronize() - kills stream overlap!
         
@@ -585,6 +574,10 @@ class IntersectionSimulation:
         self.collision_alert_time = 0
         self._warn_cooldown = 0.0  # Print throttling
         
+        # Configurable safety parameters for CBF
+        self.cbf_safe_distance = 8.0  # Safe following distance (meters)
+        self.cbf_alpha = 0.3  # CBF conservativeness (0=aggressive, 1=conservative)
+        
         # Car respawning system
         self.next_vehicle_id = max_vehicles + 1  # Start IDs after initial vehicles
         self.respawn_distance = 80.0  # Distance from center to respawn cars
@@ -612,6 +605,9 @@ class IntersectionSimulation:
         self.history_v = {}
         
         # Optimized visualization with performance settings
+        import matplotlib.style as mplstyle
+        mplstyle.use('fast')  # Enable matplotlib performance optimizations
+        
         plt.ioff()  # Turn off interactive mode for stable animation
         self.fig, (self.ax_main, self.ax_speed) = plt.subplots(1, 2, figsize=(16, 8))
         if hasattr(self.fig.canvas, "toolbar_visible"):
@@ -1099,7 +1095,13 @@ class IntersectionSimulation:
             vv = vehicle.velocity if vehicle.approach_angle == 90 else (-vehicle.velocity if vehicle.approach_angle == 270 else 0.0)
         return p, vv
 
-    def cbf_clip(self, u_nom, i, vehicles, dt, d_safe=12.0, alpha=0.5):  # Much larger safety distance and alpha
+    def cbf_clip(self, u_nom, i, vehicles, dt, d_safe=None, alpha=None):  # Configurable safety parameters
+        """Proper discrete-time CBF safety filter with configurable parameters"""
+        # Use default safety parameters if not provided
+        if d_safe is None:
+            d_safe = getattr(self, 'cbf_safe_distance', 12.0)
+        if alpha is None:
+            alpha = getattr(self, 'cbf_alpha', 0.5)
         """Proper discrete-time CBF safety filter with numerical safeguards and cross-traffic guard"""
         veh = vehicles[i]
         u_min, u_max = -veh.max_decel, veh.max_accel
@@ -1176,8 +1178,11 @@ class IntersectionSimulation:
             else:
                 u_max = min(u_max, bound)  # upper bound
 
-        # Handle infeasible case gracefully
+        # Handle infeasible case gracefully with logging
         if u_min > u_max:
+            if self._warn_cooldown <= 0.0:
+                print(f"Warning: CBF constraints infeasible for vehicle {i}: u_min={u_min:.3f} > u_max={u_max:.3f}")
+                self._warn_cooldown = 1.0  # Throttle warnings
             # Pick nearest bound to u_nom
             return u_min if abs(u_nom - u_min) < abs(u_nom - u_max) else u_max
         
@@ -1423,12 +1428,13 @@ class IntersectionSimulation:
         if self.vehicles:
             self.ax_speed.legend(loc='upper right')
         
-        # Metrics text
+        # Metrics text - properly mark as animated for blitting
         self.metrics_text = self.ax_main.text(0.02, 0.98, '', transform=self.ax_main.transAxes,
                                             verticalalignment='top', fontsize=11, fontweight='bold',
                                             color='white', animated=True,
                                             bbox=dict(boxstyle='round,pad=0.5', facecolor='#2d2d44',
                                                     edgecolor='#00ff88', linewidth=2, alpha=0.95))
+        self.metrics_text.set_animated(True)  # Explicitly set animated for blitting
     
     def _setup_vehicle_visualization(self, vehicle: VehicleState, color_index: int = None):
         """Setup visualization elements for a single vehicle"""
@@ -1442,20 +1448,28 @@ class IntersectionSimulation:
         color = self.colors[color_index % len(self.colors)]
         vehicle.color = color
         
-        # Car shape
+        # Car shape - properly mark as animated for blitting
         car_points = self.create_car_shape(vehicle)
-        self.vehicle_shapes[vehicle.id] = Polygon(car_points, facecolor=color, edgecolor='white',
-                                                linewidth=2, alpha=0.95, animated=True)
-        self.ax_main.add_patch(self.vehicle_shapes[vehicle.id])
+        polygon = Polygon(car_points, facecolor=color, edgecolor='white',
+                         linewidth=2, alpha=0.95, animated=True)
+        polygon.set_animated(True)  # Explicitly set animated for blitting
+        self.vehicle_shapes[vehicle.id] = polygon
+        self.ax_main.add_patch(polygon)
         
-        # Trail
-        self.vehicle_trails[vehicle.id], = self.ax_main.plot([], [], color=color, alpha=0.6, linewidth=2, animated=True)
+        # Trail - properly mark as animated for blitting
+        trail_line, = self.ax_main.plot([], [], color=color, alpha=0.6, linewidth=2, animated=True)
+        trail_line.set_animated(True)  # Explicitly set animated for blitting
+        self.vehicle_trails[vehicle.id] = trail_line
         
-        # Speed line
-        self.speed_lines[vehicle.id], = self.ax_speed.plot([], [], color=color, linewidth=2, label=f'V{vehicle.id}', animated=True)
+        # Speed line - properly mark as animated for blitting
+        speed_line, = self.ax_speed.plot([], [], color=color, linewidth=2, label=f'V{vehicle.id}', animated=True)
+        speed_line.set_animated(True)  # Explicitly set animated for blitting
+        self.speed_lines[vehicle.id] = speed_line
         
-        # Predicted path
-        self.predicted_paths[vehicle.id], = self.ax_main.plot([], [], color=color, linestyle=':', alpha=0.5, linewidth=1, animated=True)
+        # Predicted path - properly mark as animated for blitting
+        pred_line, = self.ax_main.plot([], [], color=color, linestyle=':', alpha=0.5, linewidth=1, animated=True)
+        pred_line.set_animated(True)  # Explicitly set animated for blitting
+        self.predicted_paths[vehicle.id] = pred_line
     
     def animate(self, frame):
         """Highly optimized animation update with aggressive performance tuning"""
@@ -1471,85 +1485,80 @@ class IntersectionSimulation:
         # Update warning cooldown
         self._warn_cooldown = max(0.0, self._warn_cooldown - self.dt)
         
-        if frame < 1000:
-            # Run simulation step
-            self.simulate_step()
+        # Run simulation step (removed frame limit for infinite animation)
+        self.simulate_step()
+        
+        # Batch update all visualizations efficiently
+        updated_artists = []
             
-            # Batch update all visualizations efficiently
-            updated_artists = []
+        # Pre-calculate common values once
+        current_time = frame * self.dt
+        
+        for vehicle in self.vehicles:
+            if vehicle.id not in self.vehicle_shapes:
+                continue
+                
+            # Update car shape (most expensive operation)
+            car_points = self.create_car_shape(vehicle)
+            self.vehicle_shapes[vehicle.id].set_xy(car_points)
+            updated_artists.append(self.vehicle_shapes[vehicle.id])
             
-            # Pre-calculate common values once
-            current_time = frame * self.dt
+            # Update trail with reduced history for performance
+            hist_len = len(self.history_x[vehicle.id])
+            if hist_len > 1:
+                # Use fewer trail points for better performance
+                trail_points = min(10, hist_len)  # Reduced from 25 to 10
+                trail_data_x = list(self.history_x[vehicle.id])[-trail_points:]
+                trail_data_y = list(self.history_y[vehicle.id])[-trail_points:]
+                self.vehicle_trails[vehicle.id].set_data(trail_data_x, trail_data_y)
+                updated_artists.append(self.vehicle_trails[vehicle.id])
             
-            for vehicle in self.vehicles:
-                if vehicle.id not in self.vehicle_shapes:
-                    continue
-                    
-                # Update car shape (most expensive operation)
-                car_points = self.create_car_shape(vehicle)
-                self.vehicle_shapes[vehicle.id].set_xy(car_points)
-                updated_artists.append(self.vehicle_shapes[vehicle.id])
-                
-                # Update trail with reduced history for performance
-                hist_len = len(self.history_x[vehicle.id])
-                if hist_len > 1:
-                    # Use fewer trail points for better performance
-                    trail_points = min(10, hist_len)  # Reduced from 25 to 10
-                    trail_data_x = list(self.history_x[vehicle.id])[-trail_points:]
-                    trail_data_y = list(self.history_y[vehicle.id])[-trail_points:]
-                    self.vehicle_trails[vehicle.id].set_data(trail_data_x, trail_data_y)
-                    updated_artists.append(self.vehicle_trails[vehicle.id])
-                
-                # Update speed plot less frequently for better performance
-                if frame % 5 == 0:  # Update every 5th frame instead of 2nd
-                    times = [i * self.dt for i in range(hist_len)]
-                    if times and self.history_v[vehicle.id]:  # Ensure data exists
-                        speed_data = list(self.history_v[vehicle.id])
-                        self.speed_lines[vehicle.id].set_data(times, speed_data)
-                        # Ensure speed plot stays visible
-                        if vehicle.id not in getattr(self, '_speed_plot_updated', set()):
-                            self.speed_lines[vehicle.id].set_visible(True)
-                            if not hasattr(self, '_speed_plot_updated'):
-                                self._speed_plot_updated = set()
-                            self._speed_plot_updated.add(vehicle.id)
-                
-                # Update predicted path with minimal GPU transfers
-                if frame % 10 == 0:  # Update every 10th frame for prediction (less frequent)
-                    if hasattr(vehicle, '_gpu_trajectory') and vehicle._gpu_trajectory is not None:
-                        with torch.no_grad():
-                            # Even fewer prediction points for performance
-                            pred_subset = vehicle._gpu_trajectory[:4].cpu().numpy()  # Reduced from 6 to 4
-                            self.predicted_paths[vehicle.id].set_data(pred_subset[:, 0], pred_subset[:, 1])
-                    elif hasattr(vehicle, 'planned_trajectory') and vehicle.planned_trajectory is not None:
-                        pred_x = vehicle.planned_trajectory[:4, 0]  # Reduced points
-                        pred_y = vehicle.planned_trajectory[:4, 1]
-                        self.predicted_paths[vehicle.id].set_data(pred_x, pred_y)
+            # Update speed plot less frequently for better performance
+            if frame % 5 == 0:  # Update every 5th frame instead of 2nd
+                times = [i * self.dt for i in range(hist_len)]
+                if times and self.history_v[vehicle.id]:  # Ensure data exists
+                    speed_data = list(self.history_v[vehicle.id])
+                    self.speed_lines[vehicle.id].set_data(times, speed_data)
+                    # Ensure speed plot stays visible
+                    if vehicle.id not in getattr(self, '_speed_plot_updated', set()):
+                        self.speed_lines[vehicle.id].set_visible(True)
+                        if not hasattr(self, '_speed_plot_updated'):
+                            self._speed_plot_updated = set()
+                        self._speed_plot_updated.add(vehicle.id)
             
-            # Update metrics less frequently
-            if frame % 5 == 0:  # Update every 5th frame
-                self._update_metrics_display(frame)
-                updated_artists.append(self.metrics_text)
+            # Update predicted path with CPU trajectories
+            if frame % 10 == 0:  # Update every 10th frame for prediction (less frequent)
+                if hasattr(vehicle, 'planned_trajectory') and vehicle.planned_trajectory is not None:
+                    # Use fewer prediction points for performance
+                    pred_x = vehicle.planned_trajectory[:4, 0]  # Reduced from full trajectory
+                    pred_y = vehicle.planned_trajectory[:4, 1]
+                    self.predicted_paths[vehicle.id].set_data(pred_x, pred_y)
             
-            # Auto-extend speed plot x-axis more frequently
-            if frame % 5 == 0 and self.vehicles:  # Every 5th frame
-                max_time = max(len(self.history_v[v.id]) * self.dt for v in self.vehicles if self.history_v[v.id])
-                if max_time > self.ax_speed.get_xlim()[1]:
-                    self.ax_speed.set_xlim(0, max_time + 5)
-                
-                # Also update y-axis to fit all speeds
-                all_speeds = []
-                for v in self.vehicles:
-                    if self.history_v[v.id]:
-                        all_speeds.extend(self.history_v[v.id])
-                
-                if all_speeds:
-                    max_speed = max(all_speeds)
-                    if max_speed > self.ax_speed.get_ylim()[1]:
-                        self.ax_speed.set_ylim(0, max_speed + 2)
-                
-                # Force redraw of speed plot
-                self.ax_speed.relim()
-                self.ax_speed.autoscale_view(scalex=True, scaley=True)
+        # Update metrics less frequently
+        if frame % 5 == 0:  # Update every 5th frame
+            self._update_metrics_display(frame)
+            updated_artists.append(self.metrics_text)
+            
+        # Auto-extend speed plot x-axis more frequently
+        if frame % 5 == 0 and self.vehicles:  # Every 5th frame
+            max_time = max(len(self.history_v[v.id]) * self.dt for v in self.vehicles if self.history_v[v.id])
+            if max_time > self.ax_speed.get_xlim()[1]:
+                self.ax_speed.set_xlim(0, max_time + 5)
+            
+            # Also update y-axis to fit all speeds
+            all_speeds = []
+            for v in self.vehicles:
+                if self.history_v[v.id]:
+                    all_speeds.extend(self.history_v[v.id])
+            
+            if all_speeds:
+                max_speed = max(all_speeds)
+                if max_speed > self.ax_speed.get_ylim()[1]:
+                    self.ax_speed.set_ylim(0, max_speed + 2)
+            
+            # Force redraw of speed plot
+            self.ax_speed.relim()
+            self.ax_speed.autoscale_view(scalex=True, scaley=True)
         
         # Return all artists that need updating
         return (list(self.vehicle_shapes.values()) + 
@@ -1622,11 +1631,23 @@ class IntersectionSimulation:
             self.setup_plot()
             self.plot_initialized = True
     
+    def init_animation(self):
+        """Initialize function for matplotlib blitting - required for proper animation"""
+        # Return all animated artists that need to be redrawn
+        artists = []
+        artists.extend(self.vehicle_shapes.values())
+        artists.extend(self.vehicle_trails.values())
+        artists.extend(self.speed_lines.values())
+        artists.extend(self.predicted_paths.values())
+        artists.append(self.metrics_text)
+        return artists
+    
     def run_animation(self):
         self.finalize_setup()
-        # Enable blitting for better performance now that artists are marked as animated
-        ani = animation.FuncAnimation(self.fig, self.animate, frames=1000,
-                                    interval=33, blit=True, repeat=False,  # Enabled blitting for better performance
+        # Enable blitting for better performance with proper init_func
+        ani = animation.FuncAnimation(self.fig, self.animate, frames=None,  # Infinite frames
+                                    init_func=self.init_animation,  # Required for blitting
+                                    interval=33, blit=True, repeat=True,  # Allow repeat
                                     cache_frame_data=False)  # Reduce memory usage
         plt.tight_layout()
         plt.show(block=True)  # Block to keep window open
@@ -1667,8 +1688,9 @@ class IntersectionSimulation:
         s = p[:, None] - p[None, :]           # [B,B]
         vrel = v[:, None] - v[None, :]        # [B,B]
 
-        d_safe = 8.0  # Reduced from 12.0 to allow closer following
-        alpha = 0.3   # Reduced from 0.5 for less aggressive safety
+        # Configurable safety parameters with reasonable defaults
+        d_safe = getattr(self, 'cbf_safe_distance', 8.0)  # Default safe distance
+        alpha = getattr(self, 'cbf_alpha', 0.3)  # Default conservativeness
         dt = self.dt
 
         # one-step linearized bound (as in your scalar CBF)
