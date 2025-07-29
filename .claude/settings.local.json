@@ -3,7 +3,9 @@
     "allow": [
       "Bash(rm:*)",
       "Bash(grep:*)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "mcp__MCP_DOCKER__resolve-library-id",
+      "mcp__MCP_DOCKER__get-library-docs"
     ],
     "deny": []
   }
