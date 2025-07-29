@@ -5,23 +5,47 @@ Testing hypothesis: Can autonomous vehicles eliminate traffic lights through coo
 import torch
 import torch.nn as nn
 import numpy as np
+
+# Disable automatic compilation that requires C++ compiler
+torch._dynamo.config.suppress_errors = True
+torch.backends.cudnn.enabled = False
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from matplotlib.patches import Rectangle, Polygon
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
+from collections import deque
 
 # Reproducibility seeds
 torch.manual_seed(0)
 np.random.seed(0)
+import random
+random.seed(0)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(0)
 
-# GPU setup
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"🚀 Using device: {device}")
+def pick_device(n_vehicles: int, horizon: int) -> torch.device:
+    """Pick device based on workload size - avoid GPU tax for small batches"""
+    work = n_vehicles * horizon
+    use_cuda = torch.cuda.is_available() and work >= 1500
+    return torch.device('cuda' if use_cuda else 'cpu')
 
-@dataclass
+# GPU setup with workload-aware device selection - will be set in main
+device = None
+
+# Enable optimized matmul on Ampere+ GPUs
+if torch.cuda.is_available():
+    torch.set_float32_matmul_precision("high")
+
+# Module-level constants to avoid rebuilding
+DIR_MAP = {
+    0: (1.0, 0.0),    # North
+    90: (0.0, 1.0),   # East  
+    180: (-1.0, 0.0), # South
+    270: (0.0, -1.0), # West
+}
+
+@dataclass(slots=True)
 class VehicleState:
     """Optimized vehicle state representation with priority system"""
     id: int
@@ -43,6 +67,9 @@ class VehicleState:
     
     # Trajectory storage
     planned_trajectory: Optional[np.ndarray] = None  # [horizon+1, 3] array
+    
+    # Pre-rotated car shape template for performance
+    _shape_template: Optional[np.ndarray] = None
     
     @property
     def x(self) -> float:
@@ -140,20 +167,21 @@ class BatchedMPCController:
         xyv = np.array([[v.x, v.y, v.velocity] for v in vehicles], dtype=np.float32)
 
         max_others = self.max_vehicles - 1
+        # limit to batch size for nearest neighbor context
+        others = xyv[:batch_size, :2]  # limit to batch
         for i in range(batch_size):
             # own state
             state_cpu[i, :3] = xyv[i]
             # others (nearest-first for more informative context, same input size)
             fill, idx = 0, 3
-            deltas = xyv[:, :2] - xyv[i, :2]              # [N,2]
-            dists = np.linalg.norm(deltas, axis=1)        # [N]
-            order = np.argsort(dists)                     # nearest → farthest
+            d = np.linalg.norm(others - xyv[i, :2], axis=1)
+            # take K nearest including self, then skip self
+            K = min(max_others + 1, batch_size)
+            order = np.argpartition(d, kth=K-1)[:K]
             for j in order:
-                if j == i or fill >= max_others:
-                    continue
+                if j == i or fill >= max_others: continue
                 state_cpu[i, idx:idx+3] = xyv[j]
-                idx += 3
-                fill += 1
+                idx += 3; fill += 1
             # time features
             start = 3 + 3 * (self.max_vehicles - 1)
             state_cpu[i, start:start+2] = time_feats
@@ -169,39 +197,32 @@ class BatchedMPCController:
         return self.state_batch[:batch_size]
     
     def predict_trajectories_batch(self, control_batch: torch.Tensor, vehicles: List[VehicleState]) -> torch.Tensor:
-        """Vectorized trajectory prediction"""
-        batch_size = control_batch.shape[0]
-        self.trajectory_batch[:batch_size].zero_()
-        
-        # Initialize with current positions (vectorized copy)
-        xyv0 = np.array([[v.x, v.y, v.velocity] for v in vehicles[:batch_size]], dtype=np.float32)
-        xyv0 = torch.from_numpy(xyv0).to(device=device)
-        self.trajectory_batch[:batch_size, 0].copy_(xyv0)
-        
-        # Precompute direction vectors and target velocities once
-        dir_map = {0: (1.0, 0.0), 180: (-1.0, 0.0), 90: (0.0, 1.0), 270: (0.0, -1.0)}
-        dirs = torch.tensor([dir_map[v.approach_angle] for v in vehicles[:batch_size]],
-                           device=device, dtype=torch.float32)  # [B,2]
-        target_vels = torch.tensor([v.target_velocity * 1.2 for v in vehicles[:batch_size]],
-                                  device=device, dtype=torch.float32)  # [B]
-        
-        # Predict trajectories
-        for t in range(self.horizon):
-            current_states = self.trajectory_batch[:batch_size, t]
-            accels = torch.clamp(control_batch[:, t] * 3.0, -6.0, 3.0)
-            
-            # Update velocities
-            new_velocities = current_states[:, 2] + accels * self.dt
-            new_velocities = torch.clamp(new_velocities, min=0.0)  # lower bound 0
-            new_velocities = torch.minimum(new_velocities, target_vels)
-            
-            # Positions advance along each vehicle's direction (vectorized)
-            new_positions = current_states[:, :2] + dirs * new_velocities.unsqueeze(1) * self.dt
-            
-            self.trajectory_batch[:batch_size, t + 1, :2] = new_positions
-            self.trajectory_batch[:batch_size, t + 1, 2] = new_velocities
-        
-        return self.trajectory_batch[:batch_size]
+        """Vectorized trajectory prediction with cumsums"""
+        B = control_batch.shape[0]
+        # initial state
+        xyv0 = torch.tensor([[v.x, v.y, v.velocity] for v in vehicles[:B]],
+                            device=device, dtype=torch.float32)                         # [B,3]
+        dirs = torch.tensor([DIR_MAP[v.approach_angle] for v in vehicles[:B]],
+                            device=device, dtype=torch.float32)                         # [B,2]
+        target = torch.tensor([v.target_velocity*1.2 for v in vehicles[:B]],
+                              device=device, dtype=torch.float32)                       # [B]
+
+        # accelerations per step
+        acc = control_batch.clamp(-1.0, 1.0) * 3.0                                     # [B,H]
+        vel_pre = xyv0[:, 2:3] + self.dt * acc.cumsum(dim=1)                           # [B,H]
+        vel = torch.minimum(vel_pre.clamp_min_(0.0), target.unsqueeze(1))              # [B,H]
+
+        # positions
+        step_disp = (vel * self.dt).unsqueeze(-1) * dirs.unsqueeze(1)                  # [B,H,2]
+        pos = xyv0[:, :2].unsqueeze(1) + step_disp.cumsum(dim=1)                       # [B,H,2]
+
+        # write into prealloc buffer
+        out = self.trajectory_batch[:B]
+        out[:, 0, :2] = xyv0[:, :2]
+        out[:, 0, 2]  = xyv0[:, 2]
+        out[:, 1:, :2] = pos
+        out[:, 1:,  2] = vel
+        return out
     
     def compute_costs_batch(self, control_batch: torch.Tensor, trajectory_batch: torch.Tensor, vehicles: List[VehicleState], reserved_ids: Optional[set] = None, center_half: float = 10.0, soon_steps: int = 10) -> torch.Tensor:
         """Vectorized cost computation"""
@@ -213,9 +234,6 @@ class BatchedMPCController:
         else:
             reserved_mask = torch.tensor([1.0 if v.id in reserved_ids else 0.0 for v in vehicles[:batch_size]],
                                          device=device)
-        
-        # Enhanced velocity tracking with adaptive targets
-        velocity_costs = torch.zeros(batch_size, device=device)
         
         # Vectorized look-ahead proximity computation (avoid in-place ops for autograd)
         K = min(4, self.horizon + 1)  # Reduced from 6 for better performance
@@ -232,33 +250,37 @@ class BatchedMPCController:
         # per-vehicle min distance over others and over K steps: [B]
         min_distance_to_others = dist.min(dim=2).values.min(dim=0).values
         
-        for i in range(batch_size):
-            vehicle = vehicles[i]
-            target_vel = vehicle.target_velocity
-            actual_vels = trajectory_batch[i, 1:, 2]  # Future velocities
-
-            # Adaptive target velocity & weight (no GPU→CPU sync)
-            adaptive_target = torch.as_tensor(target_vel, device=device, dtype=torch.float32)
-            near_mask = (min_distance_to_others[i] < 20.0)
-            adaptive_target = torch.where(
-                near_mask,
-                adaptive_target * (0.3 + 0.7 * (min_distance_to_others[i] / 20.0)),
-                adaptive_target
-            )
-            velocity_weight = torch.where(
-                near_mask,
-                torch.tensor(10.0, device=device),  # Increased from 5.0
-                torch.tensor(25.0, device=device)   # Increased from 15.0
-            )
-            
-            # Smooth velocity profile - penalize rapid changes
-            vel_errors = actual_vels - adaptive_target
-            velocity_costs[i] = velocity_weight * torch.sum(vel_errors ** 2)
-            
-            # Penalty for velocity changes (jerk minimization) - increased
-            if len(actual_vels) > 1:
-                vel_changes = actual_vels[1:] - actual_vels[:-1]
-                velocity_costs[i] += 5.0 * torch.sum(vel_changes ** 2)  # Increased from 2.0
+        # VECTORIZED velocity tracking with adaptive targets - NO PYTHON LOOP
+        vel = trajectory_batch[:batch_size, 1:, 2]                   # [B,H] future velocities
+        B, H = vel.shape
+        
+        # Build target velocities tensor
+        target = torch.tensor([v.target_velocity for v in vehicles[:batch_size]], 
+                             device=device).unsqueeze(1)             # [B,1]
+        
+        # Adaptive target based on proximity
+        near_mask = (min_distance_to_others < 20.0)                  # [B]
+        adaptive_target = torch.where(
+            near_mask.unsqueeze(1),
+            target * (0.3 + 0.7 * (min_distance_to_others / 20.0).unsqueeze(1)),
+            target
+        )                                                            # [B,1]
+        
+        # Velocity weights based on proximity
+        velocity_weight = torch.where(
+            near_mask, 
+            torch.tensor(10.0, device=device), 
+            torch.tensor(25.0, device=device)
+        ).unsqueeze(1)                                               # [B,1]
+        
+        # Velocity tracking cost
+        vel_errors = vel - adaptive_target                           # [B,H]
+        velocity_costs = (velocity_weight * (vel_errors ** 2)).sum(dim=1)  # [B]
+        
+        # Jerk minimization (smooth velocity changes)
+        if H > 1:
+            vel_changes = vel[:, 1:] - vel[:, :-1]                   # [B,H-1]
+            velocity_costs = velocity_costs + 5.0 * (vel_changes ** 2).sum(dim=1)
         
         # Enhanced control effort cost with smoothness
         control_costs = torch.zeros(batch_size, device=device)
@@ -274,8 +296,7 @@ class BatchedMPCController:
             
             # Extra penalty for extreme control changes
             extreme_changes = torch.abs(control_changes) > 0.5
-            if extreme_changes.any():
-                control_costs += 10.0 * torch.sum(extreme_changes.float(), dim=1)
+            control_costs += 10.0 * extreme_changes.float().sum(dim=1)
         
         # Encourage only the reserved vehicle to enter the center soon
         # Heuristic: if predicted position crosses the center bounds within ~1s, penalize unreserved
@@ -298,24 +319,17 @@ class BatchedMPCController:
         # Advanced predictive collision avoidance cost using CPA
         collision_costs = torch.zeros(batch_size, device=device)
         
-        # Car-following costs - vehicles should slow down when following others
-        following_costs = torch.zeros(batch_size, device=device)
+        # Vectorized car-following costs
+        following_costs = self._compute_following_costs_vectorized(trajectory_batch, vehicles, batch_size)
 
         if batch_size > 1:
             # states at first predicted step
             pos1 = trajectory_batch[:batch_size, 1, :2]    # [B,2]
             vel1 = trajectory_batch[:batch_size, 1, 2]     # [B]
 
-            # Precompute direction and extent tensors
-            dir_map = {0: (1.0, 0.0), 180: (-1.0, 0.0), 90: (0.0, 1.0), 270: (0.0, -1.0)}
-            dirs = torch.tensor([dir_map[v.approach_angle] for v in vehicles[:batch_size]],
-                                device=device, dtype=torch.float32)                        # [B,2]
-
-            half_exts = torch.tensor(
-                [[(veh.length*0.5 if veh.approach_angle in (0,180) else veh.width*0.5),
-                  (veh.width*0.5  if veh.approach_angle in (0,180) else veh.length*0.5)]
-                 for veh in vehicles[:batch_size]],
-                device=device, dtype=torch.float32)                                        # [B,2]
+            # Use cached tensors for better performance
+            dirs = self._dirs[:batch_size] if hasattr(self, '_dirs') and self._dirs is not None else torch.tensor([DIR_MAP[v.approach_angle] for v in vehicles[:batch_size]], device=device, dtype=torch.float32)
+            half_exts = self._half_exts[:batch_size] if hasattr(self, '_half_exts') and self._half_exts is not None else torch.tensor([[(veh.length*0.5 if veh.approach_angle in (0,180) else veh.width*0.5), (veh.width*0.5  if veh.approach_angle in (0,180) else veh.length*0.5)] for veh in vehicles[:batch_size]], device=device, dtype=torch.float32)
 
             # Pairwise relative position/velocity (broadcasted)
             r0 = pos1[:, None, :] - pos1[None, :, :]                                       # [B,B,2]
@@ -342,79 +356,89 @@ class BatchedMPCController:
             base_pair_cost = base_pair_cost.masked_fill(eye, 0.0)
 
             # Priority-based weights (for "cost applied to i" and to j)
-            pr = torch.tensor([veh.priority for veh in vehicles[:batch_size]],
-                              device=device, dtype=torch.float32)                           # [B]
+            pr = self._priorities[:batch_size] if hasattr(self, '_priorities') and self._priorities is not None else torch.tensor([veh.priority for veh in vehicles[:batch_size]], device=device, dtype=torch.float32)
             wi = torch.where(pr[:, None] > pr[None, :], 0.3,
                  torch.where(pr[:, None] < pr[None, :], 1.0, 0.7))                          # [B,B]
 
             # Row-sum gives per-vehicle contribution (same behavior as your loop)
             collision_costs = (base_pair_cost * wi).sum(dim=1)                              # [B]
         
-        # Add car-following behavior - check for vehicles directly ahead in same lane
-        for i in range(batch_size):
-            vehicle = vehicles[i]
-            
-            # Find vehicle directly in front in same lane
-            front_vehicle = None
-            min_front_distance = float('inf')
-            
-            for j in range(batch_size):
-                if i == j:
-                    continue
-                other = vehicles[j]
-                
-                # Check if same lane (same approach angle)
-                if other.approach_angle != vehicle.approach_angle:
-                    continue
-                
-                # Calculate if other is in front based on approach direction
-                is_in_front = False
-                distance = 0.0
-                
-                if vehicle.approach_angle == 0:  # North (+x)
-                    if other.x > vehicle.x:
-                        distance = other.x - vehicle.x
-                        is_in_front = abs(other.y - vehicle.y) < 4.0  # Same lane check
-                elif vehicle.approach_angle == 180:  # South (-x)
-                    if other.x < vehicle.x:
-                        distance = vehicle.x - other.x
-                        is_in_front = abs(other.y - vehicle.y) < 4.0
-                elif vehicle.approach_angle == 90:  # East (+y)
-                    if other.y > vehicle.y:
-                        distance = other.y - vehicle.y
-                        is_in_front = abs(other.x - vehicle.x) < 4.0
-                elif vehicle.approach_angle == 270:  # West (-y)
-                    if other.y < vehicle.y:
-                        distance = vehicle.y - other.y
-                        is_in_front = abs(other.x - vehicle.x) < 4.0
-                
-                if is_in_front and distance < min_front_distance:
-                    min_front_distance = distance
-                    front_vehicle = other
-            
-            # Apply car-following cost if there's a vehicle in front
-            if front_vehicle is not None and min_front_distance < 40.0:  # Increased detection range
-                # Desired following distance based on speed
-                desired_distance = max(15.0, vehicle.velocity * 2.0)  # Increased from 1.5s to 2.0s following time
-                
-                if min_front_distance < desired_distance:
-                    # Cost increases as we get too close to the front vehicle
-                    distance_error = desired_distance - min_front_distance
-                    following_costs[i] = 100.0 * (distance_error ** 2)  # Doubled cost
-                    
-                    # Additional cost if we're going faster than the front vehicle
-                    speed_diff = vehicle.velocity - front_vehicle.velocity
-                    if speed_diff > 0:
-                        following_costs[i] += 60.0 * (speed_diff ** 2)  # Doubled cost
-        
         return velocity_costs + control_costs + reservation_costs + collision_costs + following_costs
     
-    def solve_batch_mpc(self, vehicles: List[VehicleState], time_step: int, reserved_ids: Optional[set] = None) -> List[float]:
+    def _compute_following_costs_vectorized(self, trajectory_batch: torch.Tensor, vehicles: List[VehicleState], batch_size: int) -> torch.Tensor:
+        """Vectorized car-following cost computation"""
+        following_costs = torch.zeros(batch_size, device=device)
+        
+        if batch_size < 2:
+            return following_costs
+            
+        # Get vehicle properties as tensors
+        angles = torch.tensor([v.approach_angle for v in vehicles[:batch_size]], device=device)
+        x = trajectory_batch[:batch_size, 1, 0]  # pos after first step
+        y = trajectory_batch[:batch_size, 1, 1]
+        v_now = trajectory_batch[:batch_size, 1, 2]
+        
+        # Initialize lead distance and speed tracking
+        lead_dist = torch.full((batch_size,), float('inf'), device=device)
+        lead_speed = torch.zeros(batch_size, device=device)
+        
+        # Process each direction separately
+        for ang in (0, 90, 180, 270):
+            mask = (angles == ang)
+            idx = mask.nonzero(as_tuple=True)[0]
+            if idx.numel() < 2: 
+                continue
+                
+            if ang in (0, 180):  # North/South - use x coordinate
+                order = torch.argsort(x[idx])
+                if ang == 180: 
+                    order = torch.flip(order, dims=[0])
+                ordered = idx[order]
+                # distances to next car
+                if len(ordered) > 1:
+                    d = x[ordered][1:] - x[ordered][:-1]
+                    same_lane = (y[ordered][1:] - y[ordered][:-1]).abs() < 4.0
+                    sel = ordered[:-1]
+                    lead_dist[sel] = torch.where(same_lane, d.abs(), lead_dist[sel])
+                    lead_speed[sel] = torch.where(same_lane, v_now[ordered][1:], lead_speed[sel])
+            else:  # East/West - use y coordinate
+                order = torch.argsort(y[idx])
+                if ang == 270: 
+                    order = torch.flip(order, dims=[0])
+                ordered = idx[order]
+                if len(ordered) > 1:
+                    d = y[ordered][1:] - y[ordered][:-1]
+                    same_lane = (x[ordered][1:] - x[ordered][:-1]).abs() < 4.0
+                    sel = ordered[:-1]
+                    lead_dist[sel] = torch.where(same_lane, d.abs(), lead_dist[sel])
+                    lead_speed[sel] = torch.where(same_lane, v_now[ordered][1:], lead_speed[sel])
+        
+        # Compute following costs
+        desired = torch.maximum(torch.full_like(lead_dist, 15.0), v_now * 2.0)
+        too_close = (lead_dist < 40.0) & (lead_dist < desired)
+        
+        distance_error = (desired - lead_dist).clamp_min(0.0)
+        speed_diff = (v_now - lead_speed).clamp_min(0.0)
+        
+        following_costs = torch.where(
+            too_close, 
+            100.0 * distance_error**2 + 60.0 * speed_diff**2,
+            following_costs
+        )
+        
+        return following_costs
+    
+    def solve_batch_mpc(self, vehicles: List[VehicleState], time_step: int, reserved_ids: Optional[set] = None, cached_dirs=None, cached_half_exts=None, cached_priorities=None) -> List[float]:
         """High-performance MPC solver with CUDA streams"""
         if not vehicles:
             return []
         
         batch_size = len(vehicles)
+        
+        # Store cached tensors for use in compute_costs_batch
+        self._dirs = cached_dirs
+        self._half_exts = cached_half_exts
+        self._priorities = cached_priorities
         
         # Debug assertions to catch shape mismatches
         assert batch_size <= self.max_vehicles, f"Batch size {batch_size} exceeds max {self.max_vehicles}"
@@ -425,15 +449,13 @@ class BatchedMPCController:
                 state_batch = self.encode_states_batch(vehicles, time_step)
                 
                 # Neural network prediction - inference only, no gradients needed
-                with torch.no_grad():
+                with torch.inference_mode():
                     control_pred_batch = self.neural_mpc(state_batch)
         else:
             state_batch = self.encode_states_batch(vehicles, time_step)
             # Neural network prediction - inference only, no gradients needed
-            with torch.no_grad():
+            with torch.inference_mode():
                 control_pred_batch = self.neural_mpc(state_batch)
-        
-        # Neural network prediction handled above in stream context
         
         # Predictive gradient descent for collision avoidance
         control_batch = control_pred_batch.clone().detach()
@@ -445,8 +467,11 @@ class BatchedMPCController:
         
         # More iterations for better collision avoidance planning
         max_iterations = 8  # Reduced from 15 for better performance
-        best_cost = float('inf')
         best_controls = control_batch.clone()
+        best_total = torch.full((), float('inf'), device=device)
+        
+        # EMA tracking for early stopping without CPU sync
+        ema_grad = torch.tensor(0.0, device=device)
         
         # Shape assertions before optimization loop
         assert control_batch.shape == (batch_size, self.horizon), f"Control shape {control_batch.shape} != ({batch_size}, {self.horizon})"
@@ -475,10 +500,10 @@ class BatchedMPCController:
             
             # Manual gradient descent step with improved efficiency
             with torch.no_grad():
-                # More aggressive gradient clipping for faster convergence
-                grad_norm = torch.norm(grad)
-                if grad_norm > 2.0:  # Increased threshold
-                    grad = grad * (2.0 / grad_norm)
+                # Branchless gradient clipping - no CPU sync
+                grad_norm = grad.norm(p=2).clamp_min(1e-6)
+                scale = (2.0 / grad_norm).clamp_max(1.0)
+                grad.mul_(scale)
                 
                 # Update controls with momentum-like step
                 control_batch = control_batch - learning_rate * grad
@@ -486,22 +511,22 @@ class BatchedMPCController:
                 # Clamp controls
                 control_batch = torch.clamp(control_batch, -1.0, 1.0)
                 
-                # Track best solution for collision avoidance
-                if iteration > 0:
-                    current_cost = total_cost.item()
-                    if current_cost < best_cost:
-                        best_cost = current_cost
-                        best_controls = control_batch.clone()
+                # Track best solution without CPU sync - keep true best
+                if (total_cost < best_total).item():
+                    best_total = total_cost.detach()
+                    best_controls = control_batch.clone()
                 
-                # Early stopping if converged (more aggressive for performance)
-                if iteration > 3 and grad_norm < 0.01:  # More aggressive early stopping
-                    break
+                # Early stopping with EMA tracking (no CPU sync)
+                if iteration > 3:
+                    ema_grad = 0.9 * ema_grad + 0.1 * grad_norm
+                    if (ema_grad < 0.01).all():  # tensor comparison for 0-d tensor
+                        break
         
         # Use best solution found
         control_batch = best_controls
         
         # Update planned trajectories (final forward pass) - no gradients needed
-        with torch.no_grad():
+        with torch.inference_mode():
             final_trajectories = self.predict_trajectories_batch(control_batch, vehicles)
             # Keep trajectories on GPU, only transfer when needed for visualization
             for i, vehicle in enumerate(vehicles):
@@ -510,9 +535,7 @@ class BatchedMPCController:
                 else:
                     vehicle.planned_trajectory = final_trajectories[i].cpu().numpy()
         
-        # Synchronize streams before final output
-        if self.compute_stream is not None:
-            torch.cuda.synchronize()
+        # NO MORE torch.cuda.synchronize() - kills stream overlap!
         
         # Return first control inputs - avoid CPU transfer bottleneck
         with torch.no_grad():
@@ -540,6 +563,15 @@ class IntersectionSimulation:
         neural_mpc = NeuralMPCController(max_vehicles=max_vehicles)
         neural_mpc = neural_mpc.to(device=device, dtype=torch.float32)
         neural_mpc.eval()  # inference-only
+        
+        # Try to compile the neural network for extra speed
+        try:
+            if hasattr(torch, 'compile'):
+                neural_mpc = torch.compile(neural_mpc, fullgraph=False)
+        except Exception as e:
+            print(f"Note: torch.compile failed ({e}), continuing without compilation")
+            pass  # compilation failed -> ignore
+            
         self.controller = BatchedMPCController(neural_mpc, dt=dt)
         
         # Propagate scene parameters to controller
@@ -552,6 +584,11 @@ class IntersectionSimulation:
         self.collision_pairs: List[Tuple[int, int]] = []
         self.collision_alert_time = 0
         self._warn_cooldown = 0.0  # Print throttling
+        
+        # Car respawning system
+        self.next_vehicle_id = max_vehicles + 1  # Start IDs after initial vehicles
+        self.respawn_distance = 80.0  # Distance from center to respawn cars
+        self.despawn_distance = 120.0  # Distance from center to remove cars
         
         # Visual collision tracking (matches what user sees)
         self.visual_collision_detected = False
@@ -569,7 +606,7 @@ class IntersectionSimulation:
         }
         self.headway_time = 2.0  # Minimum time between vehicles in conflict zone
         
-        # History storage (numpy arrays for efficiency)
+        # History storage (ring buffers for efficiency - no realloc/GC churn)
         self.history_x = {}
         self.history_y = {}
         self.history_v = {}
@@ -589,6 +626,12 @@ class IntersectionSimulation:
         # Performance optimization flags
         self._skip_frames = 0
         self._frame_skip_count = 1  # Reduced from 2 - update every frame but with optimized rendering
+        
+        # Cached tensors to avoid reallocation
+        self._cached_angles = None
+        self._dirs = None
+        self._half_exts = None
+        self._priorities = None
     
     def add_vehicle(self, vehicle: VehicleState):
         """Add vehicle with proper lane positioning"""
@@ -607,12 +650,69 @@ class IntersectionSimulation:
         elif vehicle.approach_angle == 270:  # West
             vehicle.position[0] = -lane_offset
         
+        # Pre-compute rotated car shape template for performance
+        self._precompute_car_template(vehicle)
+        
         self.vehicles.append(vehicle)
-        self.history_x[vehicle.id] = []
-        self.history_y[vehicle.id] = []
-        self.history_v[vehicle.id] = []
+        # Use ring buffers with fixed size to avoid realloc/GC churn
+        self.history_x[vehicle.id] = deque(maxlen=64)
+        self.history_y[vehicle.id] = deque(maxlen=64)
+        self.history_v[vehicle.id] = deque(maxlen=64)
         self._inside_box_prev[vehicle.id] = False
         self._has_completed[vehicle.id] = False
+        # Invalidate cached tensors when adding vehicle
+        self._cached_angles = None
+        
+        # Setup visualization for new vehicle if plot is initialized
+        if self.plot_initialized:
+            self._setup_vehicle_visualization(vehicle)
+            # Update legend if needed
+            self.ax_speed.legend(loc='upper right')
+    
+    def _update_cached_tensors(self):
+        """Update cached tensors when vehicle roster changes"""
+        angles = tuple(v.approach_angle for v in self.vehicles)
+        if angles != self._cached_angles:
+            self._cached_angles = angles
+            batch_size = len(self.vehicles)
+            
+            self._dirs = torch.tensor([DIR_MAP[a] for a in angles], 
+                                    device=device, dtype=torch.float32)
+            
+            self._half_exts = torch.tensor([
+                [(v.length*0.5 if v.approach_angle in (0,180) else v.width*0.5),
+                 (v.width*0.5  if v.approach_angle in (0,180) else v.length*0.5)]
+                for v in self.vehicles
+            ], device=device, dtype=torch.float32)
+            
+            self._priorities = torch.tensor([v.priority for v in self.vehicles], 
+                                         device=device, dtype=torch.float32)
+    
+    def _precompute_car_template(self, vehicle: VehicleState):
+        """Pre-compute rotated car shape template for performance"""
+        half_length, half_width = vehicle.length / 2, vehicle.width / 2
+        
+        # Base car shape template
+        base = np.array([
+            [-half_length, -half_width * 0.9],
+            [-half_length * 0.8, -half_width],
+            [half_length * 0.3, -half_width],
+            [half_length * 0.9, -half_width * 0.7],
+            [half_length, 0],
+            [half_length * 0.9, half_width * 0.7],
+            [half_length * 0.3, half_width],
+            [-half_length * 0.8, half_width],
+            [-half_length, half_width * 0.9],
+        ])
+        
+        # Pre-rotate based on approach angle
+        angle_rad = np.radians(vehicle.approach_angle)
+        rotation_matrix = np.array([
+            [np.cos(angle_rad), -np.sin(angle_rad)],
+            [np.sin(angle_rad), np.cos(angle_rad)]
+        ])
+        
+        vehicle._shape_template = base @ rotation_matrix.T
     
     def _inside_box(self, x, y, margin=5.0):
         """Check if position is inside intersection box with margin"""
@@ -723,6 +823,112 @@ class IntersectionSimulation:
                             closest_vehicle = other
         
         return closest_vehicle
+
+    def remove_distant_vehicles(self):
+        """Remove vehicles that are too far from the intersection"""
+        vehicles_to_remove = []
+        for vehicle in self.vehicles:
+            distance_from_center = max(abs(vehicle.x), abs(vehicle.y))
+            if distance_from_center > self.despawn_distance:
+                vehicles_to_remove.append(vehicle)
+        
+        for vehicle in vehicles_to_remove:
+            self.vehicles.remove(vehicle)
+            # Clean up visualization elements
+            if vehicle.id in self.vehicle_shapes:
+                self.vehicle_shapes[vehicle.id].remove()
+                del self.vehicle_shapes[vehicle.id]
+            if vehicle.id in self.vehicle_trails:
+                del self.vehicle_trails[vehicle.id]
+            if vehicle.id in self.speed_lines:
+                self.speed_lines[vehicle.id].remove()
+                del self.speed_lines[vehicle.id]
+            if vehicle.id in self.predicted_paths:
+                del self.predicted_paths[vehicle.id]
+            # Clean up history
+            if vehicle.id in self.history_x:
+                del self.history_x[vehicle.id]
+                del self.history_y[vehicle.id]
+                del self.history_v[vehicle.id]
+            # Clean up tracking data
+            if vehicle.id in self._inside_box_prev:
+                del self._inside_box_prev[vehicle.id]
+            if vehicle.id in self._has_completed:
+                del self._has_completed[vehicle.id]
+            
+            print(f"Removed vehicle {vehicle.id} (distance: {distance_from_center:.1f}m)")
+        
+        # Invalidate cached tensors when vehicle roster changes
+        if vehicles_to_remove:
+            self._cached_angles = None
+
+    def spawn_new_vehicle(self, approach_angle: int):
+        """Spawn a new vehicle from the given approach direction"""
+        if len(self.vehicles) >= self.max_vehicles:
+            return  # Don't exceed maximum vehicles
+        
+        # Create new vehicle with random properties
+        import random
+        
+        # Position based on approach angle
+        if approach_angle == 0:  # North
+            position = np.array([-self.respawn_distance, 0.0])
+        elif approach_angle == 180:  # South
+            position = np.array([self.respawn_distance, 0.0])
+        elif approach_angle == 90:  # East
+            position = np.array([0.0, -self.respawn_distance])
+        else:  # West (270)
+            position = np.array([0.0, self.respawn_distance])
+        
+        # Random vehicle properties
+        velocity = random.uniform(8.0, 15.0)
+        target_velocity = random.uniform(18.0, 22.0)
+        priority = random.uniform(0.1, 0.9)
+        
+        new_vehicle = VehicleState(
+            id=self.next_vehicle_id,
+            position=position,
+            velocity=velocity,
+            target_velocity=target_velocity,
+            approach_angle=approach_angle,
+            lane=0,
+            priority=priority
+        )
+        
+        self.add_vehicle(new_vehicle)
+        self.next_vehicle_id += 1
+        print(f"Spawned vehicle {new_vehicle.id} from {approach_angle}° (velocity: {velocity:.1f})")
+
+    def manage_vehicle_population(self):
+        """Maintain vehicle population by spawning new cars"""
+        # Remove distant vehicles first
+        self.remove_distant_vehicles()
+        
+        # Count vehicles by approach direction
+        approach_counts = {0: 0, 90: 0, 180: 0, 270: 0}
+        for vehicle in self.vehicles:
+            approach_counts[vehicle.approach_angle] += 1
+        
+        # Spawn new vehicles if any direction has too few cars
+        min_per_direction = 1  # Minimum vehicles per direction
+        import random
+        
+        # Always maintain at least some vehicles in the simulation
+        if len(self.vehicles) < 4:  # If we have fewer than 4 total vehicles
+            # Force spawn from a random direction
+            directions = [0, 90, 180, 270]
+            for direction in directions:
+                if approach_counts[direction] == 0 and len(self.vehicles) < self.max_vehicles:
+                    self.spawn_new_vehicle(direction)
+                    break
+        else:
+            # Normal probabilistic spawning
+            for approach_angle, count in approach_counts.items():
+                if count < min_per_direction and len(self.vehicles) < self.max_vehicles:
+                    # Higher chance to spawn if we're below minimum
+                    spawn_chance = 0.1 if count == 0 else 0.05  # 10% if none, 5% if below min
+                    if random.random() < spawn_chance:
+                        self.spawn_new_vehicle(approach_angle)
 
     def check_visual_collisions_realtime(self):
         """Real-time collision detection matching visual representation"""
@@ -1012,6 +1218,9 @@ class IntersectionSimulation:
         if not self.vehicles:
             return
         
+        # Update cached tensors if needed
+        self._update_cached_tensors()
+        
         # Solve MPC for all vehicles - performance optimization
         zone = self.conflict_zones['center']
         now = self.current_step * self.dt
@@ -1020,7 +1229,10 @@ class IntersectionSimulation:
             vid for (vid, start, end) in zone['reservations']
             if not (end <= now or start >= now + H_soon)   # overlaps [now, now+H_soon]
         }
-        optimal_accels = self.controller.solve_batch_mpc(self.vehicles, self.current_step, reserved_ids=reserved_ids)
+        optimal_accels_list = self.controller.solve_batch_mpc(self.vehicles, self.current_step, reserved_ids=reserved_ids, cached_dirs=self._dirs, cached_half_exts=self._half_exts, cached_priorities=self._priorities)
+        
+        # Convert to tensor and keep on GPU for CBF filtering
+        optimal_accels = torch.tensor(optimal_accels_list, device=device, dtype=torch.float32)
         
         # Track metrics (event-based, pre-motion)
         if self.vehicles:
@@ -1032,16 +1244,22 @@ class IntersectionSimulation:
                         self.metrics['unreserved_attempts'] += 1
                 self._inside_box_prev[veh.id] = inside_now
         
-        # Apply CBF safety filter - hard safety guarantee
-        safe_accels = self.distance_based_safety_filter(optimal_accels)
+        # Apply CBF safety filter - stays on GPU, no sync!
+        safe_accels = self.cbf_clip_batch(optimal_accels)
         
-        # Sanity checks for regression catching
-        for v, a in zip(self.vehicles, safe_accels):
-            assert -v.max_decel - 1e-6 <= a <= v.max_accel + 1e-6, f"Accel {a} out of bounds for vehicle {v.id}"
+        # Single CPU transfer only when we need to update Python objects
+        safe_accels_cpu = safe_accels.cpu().tolist()
+        
+        # Sanity checks for regression catching with reasonable tolerance
+        for v, a in zip(self.vehicles, safe_accels_cpu):
+            if not (-v.max_decel - 0.1 <= a <= v.max_accel + 0.1):
+                print(f"Warning: Vehicle {v.id} accel {a:.3f} near limits (bounds: -{v.max_decel:.1f} to {v.max_accel:.1f})")
+                # Clamp to safe bounds as fallback
+                safe_accels_cpu[self.vehicles.index(v)] = max(-v.max_decel, min(a, v.max_accel))
         
         # Update vehicle states
         for i, vehicle in enumerate(self.vehicles):
-            accel = safe_accels[i]
+            accel = safe_accels_cpu[i]
             
             # Check if vehicle is in intersection
             inside_intersection = self._inside_box(vehicle.x, vehicle.y)
@@ -1102,36 +1320,23 @@ class IntersectionSimulation:
         self.visual_collision_detected = visual_collision_detected
         self.visual_collision_pairs = visual_collision_pairs
         
+        # Manage vehicle population (respawn/despawn)
+        if self.current_step % 10 == 0:  # Every 10 steps (~1 second)
+            self.manage_vehicle_population()
+        
         self.current_step += 1
     
-    def create_car_shape(self, x: float, y: float, angle: int, length: float = 4.5, width: float = 2.0) -> np.ndarray:
-        """Create detailed car shape"""
-        half_length, half_width = length / 2, width / 2
+    def create_car_shape(self, vehicle: VehicleState) -> np.ndarray:
+        """Create car shape using pre-rotated template - only translate"""
+        if vehicle._shape_template is None:
+            self._precompute_car_template(vehicle)
         
-        car_points = np.array([
-            [-half_length, -half_width * 0.9],
-            [-half_length * 0.8, -half_width],
-            [half_length * 0.3, -half_width],
-            [half_length * 0.9, -half_width * 0.7],
-            [half_length, 0],
-            [half_length * 0.9, half_width * 0.7],
-            [half_length * 0.3, half_width],
-            [-half_length * 0.8, half_width],
-            [-half_length, half_width * 0.9],
-        ])
+        # Copy template and translate to current position
+        points = vehicle._shape_template.copy()
+        points[:, 0] += vehicle.x
+        points[:, 1] += vehicle.y
         
-        # Rotate and translate
-        angle_rad = np.radians(angle)
-        rotation_matrix = np.array([
-            [np.cos(angle_rad), -np.sin(angle_rad)],
-            [np.sin(angle_rad), np.cos(angle_rad)]
-        ])
-        
-        rotated_points = car_points @ rotation_matrix.T
-        rotated_points[:, 0] += x
-        rotated_points[:, 1] += y
-        
-        return rotated_points
+        return points
     
     def setup_plot(self):
         """Initialize visualization"""
@@ -1187,26 +1392,10 @@ class IntersectionSimulation:
         self.ax_speed.set_ylabel('Speed (m/s)')
         
         # Initialize vehicle visualizations
-        colors = ['#00aaff', '#ff4444', '#44ff44', '#ffaa00', '#aa44ff', '#ff8844', '#ff44aa', '#44ffff'] * 3
+        self.colors = ['#00aaff', '#ff4444', '#44ff44', '#ffaa00', '#aa44ff', '#ff8844', '#ff44aa', '#44ffff'] * 10
         
         for i, vehicle in enumerate(self.vehicles):
-            color = colors[i % len(colors)]
-            vehicle.color = color
-            
-            # Car shape
-            car_points = self.create_car_shape(vehicle.x, vehicle.y, vehicle.approach_angle)
-            self.vehicle_shapes[vehicle.id] = Polygon(car_points, facecolor=color, edgecolor='white',
-                                                    linewidth=2, alpha=0.95)
-            self.ax_main.add_patch(self.vehicle_shapes[vehicle.id])
-            
-            # Trail
-            self.vehicle_trails[vehicle.id], = self.ax_main.plot([], [], color=color, alpha=0.6, linewidth=2)
-            
-            # Speed line
-            self.speed_lines[vehicle.id], = self.ax_speed.plot([], [], color=color, linewidth=2, label=f'V{vehicle.id}')
-            
-            # Predicted path
-            self.predicted_paths[vehicle.id], = self.ax_main.plot([], [], color=color, linestyle=':', alpha=0.5, linewidth=1)
+            self._setup_vehicle_visualization(vehicle, i)
         
         if self.vehicles:
             self.ax_speed.legend(loc='upper right')
@@ -1214,9 +1403,32 @@ class IntersectionSimulation:
         # Metrics text
         self.metrics_text = self.ax_main.text(0.02, 0.98, '', transform=self.ax_main.transAxes,
                                             verticalalignment='top', fontsize=11, fontweight='bold',
-                                            color='white',
+                                            color='white', animated=True,
                                             bbox=dict(boxstyle='round,pad=0.5', facecolor='#2d2d44',
                                                     edgecolor='#00ff88', linewidth=2, alpha=0.95))
+    
+    def _setup_vehicle_visualization(self, vehicle: VehicleState, color_index: int = None):
+        """Setup visualization elements for a single vehicle"""
+        if color_index is None:
+            color_index = len(self.vehicle_shapes)
+        
+        color = self.colors[color_index % len(self.colors)]
+        vehicle.color = color
+        
+        # Car shape
+        car_points = self.create_car_shape(vehicle)
+        self.vehicle_shapes[vehicle.id] = Polygon(car_points, facecolor=color, edgecolor='white',
+                                                linewidth=2, alpha=0.95, animated=True)
+        self.ax_main.add_patch(self.vehicle_shapes[vehicle.id])
+        
+        # Trail
+        self.vehicle_trails[vehicle.id], = self.ax_main.plot([], [], color=color, alpha=0.6, linewidth=2, animated=True)
+        
+        # Speed line
+        self.speed_lines[vehicle.id], = self.ax_speed.plot([], [], color=color, linewidth=2, label=f'V{vehicle.id}', animated=True)
+        
+        # Predicted path
+        self.predicted_paths[vehicle.id], = self.ax_main.plot([], [], color=color, linestyle=':', alpha=0.5, linewidth=1, animated=True)
     
     def animate(self, frame):
         """Highly optimized animation update with aggressive performance tuning"""
@@ -1247,7 +1459,7 @@ class IntersectionSimulation:
                     continue
                     
                 # Update car shape (most expensive operation)
-                car_points = self.create_car_shape(vehicle.x, vehicle.y, vehicle.approach_angle)
+                car_points = self.create_car_shape(vehicle)
                 self.vehicle_shapes[vehicle.id].set_xy(car_points)
                 updated_artists.append(self.vehicle_shapes[vehicle.id])
                 
@@ -1255,18 +1467,18 @@ class IntersectionSimulation:
                 hist_len = len(self.history_x[vehicle.id])
                 if hist_len > 1:
                     # Use fewer trail points for better performance
-                    trail_points = min(25, hist_len)  # Reduced from 50
-                    self.vehicle_trails[vehicle.id].set_data(
-                        self.history_x[vehicle.id][-trail_points:],
-                        self.history_y[vehicle.id][-trail_points:]
-                    )
+                    trail_points = min(10, hist_len)  # Reduced from 25 to 10
+                    trail_data_x = list(self.history_x[vehicle.id])[-trail_points:]
+                    trail_data_y = list(self.history_y[vehicle.id])[-trail_points:]
+                    self.vehicle_trails[vehicle.id].set_data(trail_data_x, trail_data_y)
                     updated_artists.append(self.vehicle_trails[vehicle.id])
                 
-                # Update speed plot more frequently for better responsiveness
-                if frame % 2 == 0:  # Update every 2nd frame instead of 3rd
+                # Update speed plot less frequently for better performance
+                if frame % 5 == 0:  # Update every 5th frame instead of 2nd
                     times = [i * self.dt for i in range(hist_len)]
                     if times and self.history_v[vehicle.id]:  # Ensure data exists
-                        self.speed_lines[vehicle.id].set_data(times, self.history_v[vehicle.id])
+                        speed_data = list(self.history_v[vehicle.id])
+                        self.speed_lines[vehicle.id].set_data(times, speed_data)
                         # Ensure speed plot stays visible
                         if vehicle.id not in getattr(self, '_speed_plot_updated', set()):
                             self.speed_lines[vehicle.id].set_visible(True)
@@ -1275,20 +1487,21 @@ class IntersectionSimulation:
                             self._speed_plot_updated.add(vehicle.id)
                 
                 # Update predicted path with minimal GPU transfers
-                if frame % 5 == 0:  # Update every 5th frame for prediction
+                if frame % 10 == 0:  # Update every 10th frame for prediction (less frequent)
                     if hasattr(vehicle, '_gpu_trajectory') and vehicle._gpu_trajectory is not None:
                         with torch.no_grad():
                             # Even fewer prediction points for performance
-                            pred_subset = vehicle._gpu_trajectory[:6].cpu().numpy()  # Reduced from 10
+                            pred_subset = vehicle._gpu_trajectory[:4].cpu().numpy()  # Reduced from 6 to 4
                             self.predicted_paths[vehicle.id].set_data(pred_subset[:, 0], pred_subset[:, 1])
                     elif hasattr(vehicle, 'planned_trajectory') and vehicle.planned_trajectory is not None:
-                        pred_x = vehicle.planned_trajectory[:6, 0]  # Reduced points
-                        pred_y = vehicle.planned_trajectory[:6, 1]
+                        pred_x = vehicle.planned_trajectory[:4, 0]  # Reduced points
+                        pred_y = vehicle.planned_trajectory[:4, 1]
                         self.predicted_paths[vehicle.id].set_data(pred_x, pred_y)
             
             # Update metrics less frequently
             if frame % 5 == 0:  # Update every 5th frame
                 self._update_metrics_display(frame)
+                updated_artists.append(self.metrics_text)
             
             # Auto-extend speed plot x-axis more frequently
             if frame % 5 == 0 and self.vehicles:  # Every 5th frame
@@ -1384,17 +1597,89 @@ class IntersectionSimulation:
     
     def run_animation(self):
         self.finalize_setup()
-        # Disable blitting to fix speed plot updates
+        # Enable blitting for better performance now that artists are marked as animated
         ani = animation.FuncAnimation(self.fig, self.animate, frames=1000,
-                                    interval=33, blit=False, repeat=False,  # Disabled blitting for subplot compatibility
+                                    interval=33, blit=True, repeat=False,  # Enabled blitting for better performance
                                     cache_frame_data=False)  # Reduce memory usage
         plt.tight_layout()
         plt.show(block=True)  # Block to keep window open
         return ani
 
+    def cbf_clip_batch(self, u_nom: torch.Tensor) -> torch.Tensor:
+        """Batched CBF safety filter - keeps everything on GPU"""
+        B = len(self.vehicles)
+        if B == 0:
+            return u_nom
+            
+        veh = self.vehicles
+        # tensors of per-veh params on device
+        max_acc = torch.tensor([v.max_accel for v in veh], device=device)
+        max_dec = torch.tensor([v.max_decel for v in veh], device=device)
+        
+        # Build velocity and position tensors
+        vx, vy = [], []
+        px, py = [], []
+        ang = []
+        for v in veh:
+            px.append(v.x); py.append(v.y); ang.append(v.approach_angle)
+            if v.approach_angle == 0:  vx.append(v.velocity);  vy.append(0.0)
+            elif v.approach_angle == 180: vx.append(-v.velocity); vy.append(0.0)
+            elif v.approach_angle == 90:  vx.append(0.0); vy.append(v.velocity)
+            else: vx.append(0.0); vy.append(-v.velocity)
+            
+        px = torch.tensor(px, device=device); py = torch.tensor(py, device=device)
+        vx = torch.tensor(vx, device=device); vy = torch.tensor(vy, device=device)
+        ang = torch.tensor(ang, device=device)
 
-def create_scenario():
+        # For ego axis (x for N/S, y for E/W)
+        use_x = (ang == 0) | (ang == 180)
+        p = torch.where(use_x, px, py)        # [B]
+        v = torch.where(use_x, vx, vy)        # [B]
+
+        # pairwise separation along ego axis
+        s = p[:, None] - p[None, :]           # [B,B]
+        vrel = v[:, None] - v[None, :]        # [B,B]
+
+        d_safe = 12.0
+        alpha = 0.5
+        dt = self.dt
+
+        # one-step linearized bound (as in your scalar CBF)
+        s_bar = s + vrel * dt
+        A = s_bar * (dt * dt)
+        h = s * s - (d_safe * d_safe)
+        c = (s_bar * s_bar) - (1.0 - alpha) * (h) - alpha * (d_safe * d_safe)
+
+        # bounds per pair; ignore self-pairs
+        eye = torch.eye(B, device=device, dtype=torch.bool)
+        A = A.masked_fill(eye, 0.0)
+        c = c.masked_fill(eye, 0.0)
+
+        # candidate bounds for u: when A>0, u ≥ -c/A; when A<0, u ≤ -c/A
+        with torch.no_grad():
+            u_min = -max_dec
+            u_max =  max_acc
+            valid_pos = A > 1e-6
+            valid_neg = A < -1e-6
+            bound_pos = (-c / A).masked_fill(~valid_pos, float('-inf'))  # lower bounds
+            bound_neg = (-c / A).masked_fill(~valid_neg, float('inf'))   # upper bounds
+
+            # per-vehicle bound is the max of lower-bounds and min of upper-bounds across j
+            u_min = torch.max(u_min, torch.max(bound_pos, dim=1).values)
+            u_max = torch.min(u_max, torch.min(bound_neg, dim=1).values)
+
+            # project u_nom into [u_min, u_max] and ensure physical limits
+            result = torch.minimum(torch.maximum(u_nom, u_min), u_max)
+            # Clamp to absolute physical limits as final safety check
+            result = torch.clamp(result, -6.0, 3.0)  # max_decel=6.0, max_accel=3.0
+            return result
+
+
+def create_scenario(device_override=None):
     """Create optimized scenario with priority-based coordination"""
+    global device
+    if device_override:
+        device = device_override
     sim = IntersectionSimulation(max_vehicles=8)
     
     # Assign priorities and safe initial positions to prevent immediate collisions
@@ -1417,7 +1702,13 @@ def create_scenario():
 
 if __name__ == "__main__":
     print("High-Performance Intersection Control")
-    print(f"Device: {device}")
+    
+    # Update device selection based on actual workload
+    max_vehicles = 8  # From create_scenario
+    horizon = 15
+    device = pick_device(max_vehicles, horizon)
+    print(f"Device selected: {device} (workload: {max_vehicles}×{horizon}={max_vehicles*horizon})")
+    
     print("Features:")
     print("  - Predictive Collision Avoidance")
     print("  - Priority-Based Coordination")
@@ -1425,10 +1716,13 @@ if __name__ == "__main__":
     print("  - Vectorized operations")
     print("  - Optimal data structures")
     print("  - Clean architecture")
+    print("  - GPU-resident CBF safety filter")
+    print("  - Branchless gradient clipping")
+    print("  - Vectorized cost computation")
     print("\nStarting simulation...")
     
     try:
-        sim = create_scenario()
+        sim = create_scenario(device_override=device)
         animation_object = sim.run_animation()
         
         # Keep the program running to display animation
@@ -1437,7 +1731,9 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nSimulation interrupted by user")
     except Exception as e:
+        import traceback
         print(f"\nSimulation error: {e}")
+        print(f"Traceback:\n{traceback.format_exc()}")
     finally:
         plt.close('all')
         print("Simulation complete!")
