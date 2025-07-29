@@ -1,5 +1,5 @@
 """
-Modern Autonomous Vehicle Traffic Simulation with Advanced ML
+Modern Autonomous Vehicle Traffic Simulation with Advanced ML + Panda3D 3D Visualization
 Testing hypothesis: Can autonomous vehicles eliminate traffic lights through coordination?
 
 Architecture:
@@ -8,6 +8,7 @@ Architecture:
 - Learned communication protocols between vehicles
 - Continuous action spaces for realistic control
 - Transformer networks for sequential decision making
+- Panda3D for immersive 3D visualization
 """
 
 import torch
@@ -18,14 +19,41 @@ import torch.optim as optim
 # Advanced ML dependencies (optional)
 try:
     import torch_geometric
-    from torch_geometric.nn import GATConv
-    from torch_geometric.data import Data
+    from torch_geometric.nn import GATConv, SAGEConv, GCNConv
+    from torch_geometric.data import Data, Batch
+    from torch_geometric.utils import to_dense_batch
     ADVANCED_ML_AVAILABLE = True
+    print("🔥 Advanced ML with GraphSAGE enabled!")
 except ImportError:
     print("📦 Advanced ML features require torch_geometric")
     print("💡 Install with: pip install torch_geometric")
     print("🔄 Falling back to standard training...")
     ADVANCED_ML_AVAILABLE = False
+
+# Panda3D dependencies (optional)
+try:
+    from direct.showbase.ShowBase import ShowBase
+    from direct.task import Task
+    from direct.actor.Actor import Actor
+    from panda3d.core import (
+        CardMaker, NodePath, DirectionalLight, AmbientLight, 
+        PointLight, Fog, TransparencyAttrib, TextNode,
+        PerspectiveLens, OrthographicLens, Camera,
+        LColor, Vec3, Point3, CollisionTraverser,
+        CollisionHandlerQueue, CollisionRay, CollisionNode,
+        CollisionSphere, BitMask32, Texture, TextureStage,
+        SamplerState, WindowProperties, FrameBufferProperties,
+        GraphicsPipe, Shader, ShaderAttrib
+    )
+    from direct.showbase.DirectObject import DirectObject
+    from direct.gui.OnscreenText import OnscreenText
+    from direct.gui.DirectGui import DirectButton, DirectFrame
+    PANDA3D_AVAILABLE = True
+    print("🎮 Panda3D available - 3D visualization enabled!")
+except ImportError:
+    print("📦 Panda3D not found - install with: pip install panda3d")
+    print("🔄 Falling back to 2D pygame visualization...")
+    PANDA3D_AVAILABLE = False
 
 import pygame
 import numpy as np
@@ -37,9 +65,7 @@ import time
 from rich.console import Console
 from rich.progress import track
 from rich.table import Table
-
 from rich.panel import Panel
-
 
 # Initialize rich console for better logging
 console = Console()
@@ -400,7 +426,11 @@ class AutonomousVehicle:
             0, 0, 0, 0, 0, 0  # Reserved
         ]
         
-        return torch.FloatTensor(features)
+        # Create tensor on correct device if available
+        tensor = torch.FloatTensor(features)
+        if hasattr(self, '_trainer') and hasattr(self._trainer, 'device'):
+            tensor = tensor.to(self._trainer.device)
+        return tensor
     
     def calculate_exit_distance(self) -> float:
         """Calculate minimum distance to any exit boundary"""
@@ -447,7 +477,8 @@ class AutonomousVehicle:
         
         # Guard against empty history
         if not self.observation_history:
-            return torch.zeros(seq_len, 64)
+            device = self._trainer.device if hasattr(self, '_trainer') and hasattr(self._trainer, 'device') else 'cpu'
+            return torch.zeros(seq_len, 64, device=device)
             
         if len(self.observation_history) < seq_len:
             sequence = [torch.zeros_like(self.observation_history[0]) for _ in range(seq_len - len(self.observation_history))]
@@ -463,8 +494,9 @@ class AutonomousVehicle:
         # This bypasses the neural network entirely to test if vehicles can move
         if hasattr(self, '_debug_simple_movement') and self._debug_simple_movement:
             # Simple forward action: [acceleration, steering, communication]
-            action = torch.tensor([0.8, 0.0, 0.0])  # Strong forward acceleration
-            return action, torch.tensor(0.0)
+            device = self._trainer.device if hasattr(self, '_trainer') and hasattr(self._trainer, 'device') else 'cpu'
+            action = torch.tensor([0.8, 0.0, 0.0], device=device)  # Strong forward acceleration
+            return action, torch.tensor(0.0, device=device)
         
         # ADVANCED PATH: GNN + Communication + Continuous Actions
         if (hasattr(self, 'policy_net') and hasattr(self.policy_net, 'continuous_actions') 
@@ -476,7 +508,8 @@ class AutonomousVehicle:
                 comm_vector = torch.mean(torch.stack(received_messages), dim=0)
                 self.received_messages = []  # Clear buffer
             else:
-                comm_vector = torch.zeros(8)
+                device = self.policy_net.action_mean.weight.device if hasattr(self.policy_net, 'action_mean') else 'cpu'
+                comm_vector = torch.zeros(8, device=device)
             
             # Get all vehicles 
             all_vehicles = getattr(self, '_all_vehicles', [self])
@@ -494,10 +527,10 @@ class AutonomousVehicle:
             if len(action) > 2:
                 self.comm_intensity = torch.sigmoid(action[2]).item()
             
-            # Broadcast message if needed
-            if (hasattr(self, 'communication') and self.comm_intensity > 0.5):
-                message = self.policy_net.get_communication_message(all_vehicles, self)
-                self.communication.broadcast_message(self, all_vehicles, message)
+            # Broadcast message if needed (simplified - remove complex broadcasting for now)
+            # if (hasattr(self, 'communication') and self.comm_intensity > 0.5):
+            #     message = self.policy_net.get_communication_message(all_vehicles, self)
+            #     self.communication.broadcast_message(self, all_vehicles, message)
             
             return action.detach(), log_prob.detach()
         
@@ -508,7 +541,8 @@ class AutonomousVehicle:
             
             if observations is None:
                 action = random.randint(0, 3)
-                return torch.tensor(action), torch.tensor(0.0)
+                device = 'cpu'  # Discrete actions typically stay on CPU
+                return torch.tensor(action, device=device), torch.tensor(0.0, device=device)
                 
             input_sequence = self.prepare_sequence().unsqueeze(0)
             
@@ -517,13 +551,15 @@ class AutonomousVehicle:
                 action = torch.argmax(q_vals).item()
             
             self.action_history.append(action)
-            return torch.tensor(action), torch.tensor(0.0)  # No log_prob for discrete
+            device = 'cpu'  # Discrete actions typically stay on CPU
+            return torch.tensor(action, device=device), torch.tensor(0.0, device=device)  # No log_prob for discrete
         
         # Emergency fallback - use simple forward movement
         print("⚠️  WARNING: Vehicle has no policy network - using forward movement!")
         # Simple continuous action: [moderate acceleration, no steering, no communication]
-        action = torch.tensor([0.5, 0.0, 0.0])  # Should give ~3 m/s² acceleration
-        return action, torch.tensor(0.0)
+        device = self._trainer.device if hasattr(self, '_trainer') and hasattr(self._trainer, 'device') else 'cpu'
+        action = torch.tensor([0.5, 0.0, 0.0], device=device)  # Should give ~3 m/s² acceleration
+        return action, torch.tensor(0.0, device=device)
     
     def execute_action(self, action, dt: float):
         """Execute control action - supports both discrete and continuous actions"""
@@ -633,8 +669,6 @@ class AutonomousVehicle:
         # Get observations and update history
         observations = self.get_observations(other_vehicles, intersections)
         self.observation_history.append(observations)
-        
-        # Update collision risk
         self.calculate_collision_risk(other_vehicles)
     
     def update(self, dt: float, other_vehicles: List['AutonomousVehicle'], 
@@ -1232,11 +1266,527 @@ class TrainingVisualization:
         pygame.quit()
 
 # ============================================================================
+# PANDA3D 3D VISUALIZATION SYSTEM
+# ============================================================================
+
+class Panda3DVisualization(ShowBase):
+    """Immersive 3D visualization using Panda3D"""
+    def __init__(self, width: int = 1600, height: int = 900):
+        if not PANDA3D_AVAILABLE:
+            raise ImportError("Panda3D not available. Install with: pip install panda3d")
+        
+        ShowBase.__init__(self)
+        
+        # Initialize attributes first before calling any methods that use them
+        self.vehicle_nodes = {}  # Maps vehicle IDs to NodePaths
+        self.intersection_nodes = []
+        
+        # Window configuration
+        props = WindowProperties()
+        props.setTitle("🚗 Autonomous Vehicle 3D Simulation - Neural Network Training")
+        props.setSize(width, height)
+        self.win.requestProperties(props)
+        
+        # Camera setup - bird's eye view for traffic monitoring
+        self.camera.setPos(600, -800, 400)  # Position above and behind the scene
+        self.camera.lookAt(600, 400, 0)     # Look at center of intersection area
+        
+        # Training metrics
+        self.current_episode = 0
+        self.total_episodes = 0
+        self.training_metrics = {
+            'reward': 0, 'throughput': 0, 'loss': 0, 'epsilon': 0,
+            'vehicles': 0, 'cooperation': 0, 'collision_risk': 0
+        }
+        
+        # Enhanced lighting for realistic 3D environment
+        self.setup_lighting()
+        
+        # Create 3D environment
+        self.setup_environment()
+        
+        # UI elements
+        self.setup_ui()
+        
+        # Animation and update tasks
+        self.taskMgr.add(self.update_scene, "update_scene")
+        
+        # Camera controls
+        self.setup_camera_controls()
+        
+    def setup_lighting(self):
+        """Create realistic lighting for the 3D scene"""
+        # Ambient light for overall illumination
+        ambient_light = AmbientLight('ambient')
+        ambient_light.setColor((0.3, 0.3, 0.4, 1))
+        ambient_np = self.render.attachNewNode(ambient_light)
+        self.render.setLight(ambient_np)
+        
+        # Directional light (sun) for shadows and depth
+        sun_light = DirectionalLight('sun')
+        sun_light.setColor((0.8, 0.8, 0.7, 1))
+        sun_light.setDirection(Vec3(-1, -1, -0.5))
+        sun_np = self.render.attachNewNode(sun_light)
+        sun_np.setPos(600, 400, 500)
+        self.render.setLight(sun_np)
+        
+        # Additional point lights at intersections for better visibility
+        for i, pos in enumerate([(400, 300), (800, 300), (400, 500), (800, 500)]):
+            point_light = PointLight(f'intersection_light_{i}')
+            point_light.setColor((0.4, 0.4, 0.5, 1))
+            point_np = self.render.attachNewNode(point_light)
+            point_np.setPos(pos[0], pos[1], 50)
+            self.render.setLight(point_np)
+        
+        # Atmospheric fog for depth perception
+        fog = Fog('atmosphere')
+        fog.setColor(0.8, 0.8, 0.9)
+        fog.setExpDensity(0.0008)
+        self.render.setFog(fog)
+    
+    def setup_environment(self):
+        """Create the 3D road environment"""
+        # Ground plane
+        ground = self.create_ground_plane()
+        ground.reparentTo(self.render)
+        
+        # Road system
+        self.create_road_system()
+        
+        # Intersections
+        self.create_intersections()
+        
+        # Environmental elements
+        self.create_environment_details()
+    
+    def create_ground_plane(self):
+        """Create a textured ground plane"""
+        cm = CardMaker('ground')
+        cm.setFrame(-100, 1300, -100, 900)  # Large ground area
+        ground = self.render.attachNewNode(cm.generate())
+        ground.setP(-90)  # Rotate to be horizontal
+        ground.setColor(0.2, 0.4, 0.2, 1)  # Dark green grass
+        
+        # Add subtle texture variation
+        ground.setTexScale(TextureStage.getDefault(), 50, 50)
+        return ground
+    
+    def create_road_system(self):
+        """Create 3D road network"""
+        # Road material properties
+        road_color = (0.3, 0.3, 0.35, 1)
+        lane_line_color = (0.9, 0.9, 0.9, 1)
+        
+        # Horizontal roads
+        for y in [300, 500]:
+            road = self.create_road_segment(0, y-30, 1200, 60, road_color)
+            road.reparentTo(self.render)
+            
+            # Lane markings
+            for x in range(50, 1200, 40):
+                marking = self.create_lane_marking(x, y, 20, 2, lane_line_color)
+                marking.reparentTo(self.render)
+        
+        # Vertical roads  
+        for x in [400, 800]:
+            road = self.create_road_segment(x-30, 0, 60, 800, road_color)
+            road.reparentTo(self.render)
+            
+            # Lane markings
+            for y in range(50, 800, 40):
+                marking = self.create_lane_marking(x, y, 2, 20, lane_line_color)
+                marking.reparentTo(self.render)
+    
+    def create_road_segment(self, x, y, width, height, color):
+        """Create a single road segment"""
+        cm = CardMaker('road')
+        cm.setFrame(0, width, 0, height)
+        road = self.render.attachNewNode(cm.generate())
+        road.setPos(x, y, 0.1)  # Slightly above ground
+        road.setColor(*color)
+        road.setP(-90)  # Make horizontal
+        return road
+    
+    def create_lane_marking(self, x, y, width, height, color):
+        """Create lane markings"""
+        cm = CardMaker('lane_marking')
+        cm.setFrame(-width/2, width/2, -height/2, height/2)
+        marking = self.render.attachNewNode(cm.generate())
+        marking.setPos(x, y, 0.2)  # Above road surface
+        marking.setColor(*color)
+        marking.setP(-90)
+        return marking
+    
+    def create_intersections(self):
+        """Create 3D intersection visualizations"""
+        intersection_positions = [(400, 300), (800, 300), (400, 500), (800, 500)]
+        
+        for i, (x, y) in enumerate(intersection_positions):
+            # Intersection platform
+            cm = CardMaker(f'intersection_{i}')
+            cm.setFrame(-40, 40, -40, 40)
+            intersection = self.render.attachNewNode(cm.generate())
+            intersection.setPos(x, y, 0.15)
+            intersection.setColor(0.4, 0.4, 0.4, 1)  # Darker intersection color
+            intersection.setP(-90)
+            
+            # Traffic coordination indicator (will change color based on occupancy)
+            indicator = self.create_traffic_indicator(x, y)
+            indicator.reparentTo(self.render)
+            
+            self.intersection_nodes.append({
+                'node': intersection,
+                'indicator': indicator,
+                'position': (x, y),
+                'occupancy': 0
+            })
+    
+    def create_traffic_indicator(self, x, y):
+        """Create traffic coordination status indicator"""
+        cm = CardMaker('indicator')
+        cm.setFrame(-5, 5, -5, 5)
+        indicator = self.render.attachNewNode(cm.generate())
+        indicator.setPos(x, y, 20)  # Elevated above intersection
+        indicator.setColor(0, 1, 0, 0.7)  # Green = clear
+        indicator.setTransparency(TransparencyAttrib.MAlpha)
+        indicator.setP(-90)
+        indicator.setBillboardAxis()  # Always face camera
+        return indicator
+    
+    def create_environment_details(self):
+        """Add environmental details for immersion"""
+        # Simple buildings/structures around the road network
+        building_positions = [
+            (200, 150, 30), (600, 150, 25), (1000, 150, 35),
+            (200, 650, 28), (600, 650, 32), (1000, 650, 30),
+            (150, 400, 20), (1050, 400, 25)
+        ]
+        
+        for i, (x, y, height) in enumerate(building_positions):
+            building = self.create_building(x, y, height)
+            building.reparentTo(self.render)
+    
+    def create_building(self, x, y, height):
+        """Create simple building structures"""
+        cm = CardMaker('building')
+        cm.setFrame(-15, 15, 0, height)
+        building = self.render.attachNewNode(cm.generate())
+        building.setPos(x, y, 0)
+        building.setColor(0.6, 0.6, 0.7, 1)
+        building.lookAt(600, 400, 0)  # Face toward center
+        return building
+    
+    def create_vehicle_model(self, vehicle_id: int):
+        """Create 3D vehicle model"""
+        # Create vehicle body
+        cm = CardMaker(f'vehicle_{vehicle_id}')
+        cm.setFrame(-6, 6, -3, 3)  # 12x6 meter vehicle
+        vehicle_node = self.render.attachNewNode(cm.generate())
+        vehicle_node.setColor(0.8, 0.2, 0.2, 1)  # Red vehicle
+        vehicle_node.setP(-90)  # Make horizontal
+        vehicle_node.setZ(1)  # Slightly above road
+        
+        # Add vehicle details
+        # Windshield
+        windshield = CardMaker('windshield')
+        windshield.setFrame(-4, 4, -2, 2)
+        windshield_node = vehicle_node.attachNewNode(windshield.generate())
+        windshield_node.setPos(0, 0, 2)
+        windshield_node.setColor(0.2, 0.2, 0.4, 0.8)
+        windshield_node.setTransparency(TransparencyAttrib.MAlpha)
+        
+        # Direction indicator
+        indicator = CardMaker('direction')
+        indicator.setFrame(-1, 1, -1, 1)
+        indicator_node = vehicle_node.attachNewNode(indicator.generate())
+        indicator_node.setPos(5, 0, 1)  # Front of vehicle
+        indicator_node.setColor(1, 1, 1, 1)  # White
+        
+        return vehicle_node
+    
+    def setup_ui(self):
+        """Setup 3D UI elements"""
+        # Title
+        self.title_text = OnscreenText(
+            text="🚗 Autonomous Vehicle 3D Neural Network Training",
+            pos=(0, 0.9), scale=0.08, fg=(1, 1, 1, 1),
+            align=TextNode.ACenter, mayChange=True
+        )
+        
+        # Training metrics display
+        self.metrics_text = OnscreenText(
+            text="", pos=(-0.95, 0.8), scale=0.05, fg=(1, 1, 1, 1),
+            align=TextNode.ALeft, mayChange=True
+        )
+        
+        # Episode progress
+        self.progress_text = OnscreenText(
+            text="", pos=(-0.95, 0.6), scale=0.05, fg=(0.8, 1, 0.8, 1),
+            align=TextNode.ALeft, mayChange=True
+        )
+        
+        # Performance stats
+        self.performance_text = OnscreenText(
+            text="", pos=(-0.95, 0.4), scale=0.05, fg=(1, 0.8, 0.8, 1),
+            align=TextNode.ALeft, mayChange=True
+        )
+        
+        # Controls help
+        self.controls_text = OnscreenText(
+            text="Controls: Mouse = Rotate Camera | Wheel = Zoom | ESC = Exit",
+            pos=(0, -0.9), scale=0.04, fg=(0.8, 0.8, 0.8, 1),
+            align=TextNode.ACenter, mayChange=False
+        )
+    
+    def setup_camera_controls(self):
+        """Setup interactive camera controls"""
+        # Mouse camera control
+        self.camera_pivot = self.render.attachNewNode("camera_pivot")
+        self.camera_pivot.setPos(600, 400, 0)  # Center of scene
+        
+        # Accept mouse events
+        self.accept("mouse1", self.start_camera_rotate)
+        self.accept("mouse1-up", self.stop_camera_rotate)
+        self.accept("wheel_up", self.zoom_in)
+        self.accept("wheel_down", self.zoom_out)
+        
+        # Accept escape key for training mode
+        self.accept("escape", self.request_exit)
+        
+        self.camera_rotating = False
+        self.last_mouse_pos = None
+        self._escape_pressed = False
+    
+    def start_camera_rotate(self):
+        """Start camera rotation"""
+        self.camera_rotating = True
+        self.last_mouse_pos = None
+    
+    def stop_camera_rotate(self):
+        """Stop camera rotation"""
+        self.camera_rotating = False
+    
+    def zoom_in(self):
+        """Zoom camera in"""
+        current_pos = self.camera.getPos()
+        center = Vec3(600, 400, 0)
+        direction = current_pos - center
+        direction.normalize()
+        new_pos = current_pos - direction * 50
+        self.camera.setPos(new_pos)
+    
+    def zoom_out(self):
+        """Zoom camera out"""
+        current_pos = self.camera.getPos()
+        center = Vec3(600, 400, 0)
+        direction = current_pos - center
+        direction.normalize()
+        new_pos = current_pos + direction * 50
+        self.camera.setPos(new_pos)
+    
+    def request_exit(self):
+        """Request exit from training/simulation"""
+        self._escape_pressed = True
+        print("🛑 Exit requested via ESC key...")
+    
+    def update_vehicles(self, vehicles: List):
+        """Update 3D vehicle positions and states"""
+        current_vehicle_ids = set(v.id for v in vehicles)
+        
+        # Remove vehicles that no longer exist
+        for vehicle_id in list(self.vehicle_nodes.keys()):
+            if vehicle_id not in current_vehicle_ids:
+                self.vehicle_nodes[vehicle_id].removeNode()
+                del self.vehicle_nodes[vehicle_id]
+        
+        # Update existing vehicles and create new ones
+        for vehicle in vehicles:
+            if vehicle.id not in self.vehicle_nodes:
+                # Create new vehicle
+                self.vehicle_nodes[vehicle.id] = self.create_vehicle_model(vehicle.id)
+            
+            # Update vehicle position and orientation
+            vehicle_node = self.vehicle_nodes[vehicle.id]
+            vehicle_node.setPos(vehicle.x, vehicle.y, 1)
+            vehicle_node.setH(math.degrees(-vehicle.heading) + 90)  # Convert to Panda3D heading
+            
+            # Color based on behavior and state
+            if vehicle.behavior_mode == 'cooperative':
+                color = (0.2, 0.8, 0.2, 1)  # Green for cooperative
+            elif vehicle.collision_risk > 0.5:
+                color = (1, 0.5, 0, 1)  # Orange for high risk
+            elif vehicle.speed < 5:
+                color = (0.8, 0.8, 0.2, 1)  # Yellow for slow
+            else:
+                color = (0.2, 0.5, 1, 1)  # Blue for normal
+            
+            vehicle_node.setColor(*color)
+            
+            # Scale based on speed (visual feedback)
+            speed_scale = 1.0 + (vehicle.speed / 45.0) * 0.3
+            vehicle_node.setScale(speed_scale, 1, 1)
+    
+    def update_intersections(self, intersections: List):
+        """Update intersection status indicators"""
+        for i, intersection_data in enumerate(intersections):
+            if i < len(self.intersection_nodes):
+                # Calculate occupancy
+                occupancy = intersection_data.get('occupancy', 0)
+                
+                # Update indicator color based on traffic
+                indicator = self.intersection_nodes[i]['indicator']
+                if occupancy > 3:
+                    indicator.setColor(1, 0, 0, 0.8)  # Red - congested
+                elif occupancy > 1:
+                    indicator.setColor(1, 0.5, 0, 0.8)  # Orange - moderate
+                elif occupancy > 0:
+                    indicator.setColor(1, 1, 0, 0.8)  # Yellow - light traffic
+                else:
+                    indicator.setColor(0, 1, 0, 0.7)  # Green - clear
+                
+                # Animate indicator based on activity
+                scale = 1.0 + occupancy * 0.2
+                indicator.setScale(scale)
+    
+    def update_metrics_display(self):
+        """Update on-screen metrics"""
+        # Training progress
+        progress_pct = (self.current_episode / max(1, self.total_episodes)) * 100
+        
+        metrics_text = f"""Episode: {self.current_episode}/{self.total_episodes} ({progress_pct:.1f}%)
+Reward: {self.training_metrics['reward']:6.2f}
+Throughput: {self.training_metrics['throughput']:3d} vehicles
+Loss: {self.training_metrics['loss']:6.4f}
+Active Vehicles: {self.training_metrics['vehicles']:2d}"""
+        
+        self.metrics_text.setText(metrics_text)
+        
+        # Performance assessment
+        if self.training_metrics['throughput'] > 40:
+            perf_status = "🔥 EXCELLENT Performance"
+            perf_color = (0.2, 1, 0.2, 1)
+        elif self.training_metrics['throughput'] > 25:
+            perf_status = "✅ GOOD Performance"
+            perf_color = (0.8, 1, 0.2, 1)
+        elif self.training_metrics['throughput'] > 15:
+            perf_status = "⚠️ LEARNING Phase"
+            perf_color = (1, 1, 0.2, 1)
+        else:
+            perf_status = "🐌 NEEDS TRAINING"
+            perf_color = (1, 0.5, 0.2, 1)
+        
+        performance_text = f"""{perf_status}
+Cooperation: {self.training_metrics['cooperation']:.1%}
+Collision Risk: {self.training_metrics['collision_risk']:.1%}
+Neural Network Learning Active"""
+        
+        self.performance_text.setText(performance_text)
+        self.performance_text.setFg(perf_color)
+        
+        # Learning phase
+        if self.current_episode <= 20:
+            phase = "🌱 EXPLORATION: Discovering coordination patterns"
+        elif self.current_episode <= 50:
+            phase = "🧠 LEARNING: Optimizing intersection strategies"
+        elif self.current_episode <= 80:
+            phase = "⚡ REFINEMENT: Perfecting coordination"
+        else:
+            phase = "🎯 MASTERY: Expert autonomous coordination"
+        
+        self.progress_text.setText(phase)
+    
+    def update_scene(self, task):
+        """Main scene update task"""
+        # Update UI
+        self.update_metrics_display()
+        
+        # Handle camera rotation
+        if self.camera_rotating and self.mouseWatcherNode.hasMouse():
+            mouse_pos = (self.mouseWatcherNode.getMouseX(), self.mouseWatcherNode.getMouseY())
+            if self.last_mouse_pos:
+                dx = mouse_pos[0] - self.last_mouse_pos[0]
+                dy = mouse_pos[1] - self.last_mouse_pos[1]
+                
+                # Rotate camera around scene center
+                current_pos = self.camera.getPos()
+                center = Vec3(600, 400, 0)
+                
+                # Horizontal rotation
+                angle_h = dx * 180
+                self.camera.setPos(center)
+                self.camera.setH(self.camera.getH() + angle_h)
+                
+                # Move camera back to distance
+                self.camera.setPos(current_pos)
+                
+            self.last_mouse_pos = mouse_pos
+        
+        return task.cont
+    
+    def start_training(self, total_episodes: int):
+        """Initialize training visualization"""
+        self.total_episodes = total_episodes
+        self.current_episode = 0
+        print("🎮 3D Training visualization started!")
+    
+    def update_episode(self, episode: int, results: Dict, epsilon: float = 0.0):
+        """Update with episode results"""
+        self.current_episode = episode
+        self.training_metrics.update({
+            'reward': results['avg_reward'],
+            'throughput': results['throughput'],
+            'loss': results['avg_loss'],
+            'epsilon': epsilon
+        })
+    
+    def update_realtime_metrics(self, vehicles: List, intersections: List):
+        """Update real-time simulation metrics"""
+        if vehicles:
+            self.training_metrics.update({
+                'vehicles': len(vehicles),
+                'cooperation': sum(1 for v in vehicles if v.behavior_mode == 'cooperative') / len(vehicles),
+                'collision_risk': np.mean([v.collision_risk for v in vehicles])
+            })
+        
+        # Update 3D scene
+        self.update_vehicles(vehicles)
+        self.update_intersections(intersections)
+    
+    def handle_events(self) -> bool:
+        """Handle input events, return False to stop training"""
+        # Check for ESC key to exit (only if explicitly requested)
+        if hasattr(self, 'userExit') and self.userExit:
+            return False
+        
+        # Check for explicit escape key press
+        if hasattr(self, '_escape_pressed') and self._escape_pressed:
+            return False
+            
+        return True
+    
+    def update_display(self, vehicles: List = None, intersections: List = None):
+        """Update the 3D display"""
+        if vehicles and intersections:
+            self.update_realtime_metrics(vehicles, intersections)
+        
+        # Process Panda3D events without blocking
+        try:
+            # Run one frame of Panda3D's task manager
+            self.taskMgr.step()
+        except:
+            # If there's an issue with the window, don't crash the training
+            pass
+    
+    def close(self):
+        """Clean up Panda3D"""
+        self.userExit = True
+
+# ============================================================================
 # TRAINING SYSTEM (UPDATED)
 # ============================================================================
 
 class TrafficTrainer:
-    """Real GRPO-based training system"""
+    """Real GRPO-based training system with GPU optimization"""
     def __init__(self, use_advanced_ml: bool = True):
         if use_advanced_ml and not ADVANCED_ML_AVAILABLE:
             raise ImportError("Install torch_geometric for advanced ML: pip install torch_geometric")
@@ -1248,29 +1798,48 @@ class TrafficTrainer:
             if hasattr(self.policy_net, 'action_log_std'):
                 nn.init.constant_(self.policy_net.action_log_std.bias, -1.0)
             
-            self.optimizer = optim.Adam(self.policy_net.parameters(), lr=0.0003)
+            # Optimized learning rate and optimizer for GPU
+            self.optimizer = optim.AdamW(self.policy_net.parameters(), lr=0.001, weight_decay=0.01)
             self.grpo = GRPO(self.policy_net, self.optimizer)
-            self.communication = VehicleCommunication()
             self.use_advanced_ml = True
             
-            # Set to GPU if available
+            # Set to GPU if available with optimizations
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             self.policy_net.to(self.device)
-            # Move communication networks to same device
-            self.communication.message_encoder.to(self.device)
-            self.communication.message_decoder.to(self.device)
-            print(f"🎮 Using device: {self.device}")
+            
+            # GPU optimizations
+            if torch.cuda.is_available():
+                gpu_name = torch.cuda.get_device_name(0)
+                gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+                print(f"🎮 Using GPU: {gpu_name} ({gpu_memory:.1f}GB)")
+                
+                # Enable GPU optimizations
+                torch.backends.cudnn.benchmark = True  # Optimize for consistent input sizes
+                torch.backends.cuda.matmul.allow_tf32 = True  # Use TensorFloat-32 for faster training
+                torch.backends.cudnn.allow_tf32 = True
+                
+                # Enable mixed precision training for RTX cards
+                self.use_mixed_precision = True
+                self.scaler = torch.cuda.amp.GradScaler()
+                print("🚀 GPU optimizations enabled: TF32, cuDNN benchmark, mixed precision")
+            else:
+                print(f"🎮 Using CPU (GPU not available)")
+                self.use_mixed_precision = False
+                self.scaler = None
+            print(f"   Device: {self.device}")
         else:
+            # Fallback to discrete transformer
             self.policy_net = TrafficTransformer()
             self.optimizer = optim.Adam(self.policy_net.parameters(), lr=0.0001)
             self.grpo = None
-            self.communication = None
             self.use_advanced_ml = False
             self.device = torch.device('cpu')
+            self.use_mixed_precision = False
+            self.scaler = None
         
-        # GRPO trajectory collection (no more replay buffer!)
+        # GRPO trajectory collection with larger batches for GPU
         self.trajectory = []
-        self.rollout_length = 32  # Collect trajectories every N steps
+        self.rollout_length = 64 if torch.cuda.is_available() else 32  # Larger batches for GPU
         
         # Environment
         self.vehicles = []
@@ -1355,7 +1924,6 @@ class TrafficTrainer:
                 # Wire the real policy network
                 if self.use_advanced_ml:
                     vehicle.policy_net = self.policy_net
-                    vehicle.communication = self.communication
                     vehicle._all_vehicles = self.vehicles  # For GNN
                 else:
                     vehicle.transformer = self.policy_net  # Fallback
@@ -1447,7 +2015,7 @@ class TrafficTrainer:
         return np.clip(reward, -10.0, 20.0)
     
     def grpo_update(self):
-        """Real GRPO update from collected trajectories"""
+        """Real GRPO update from collected trajectories with mixed precision"""
         if len(self.trajectory) < self.rollout_length:
             return {'policy_loss': 0.0, 'kl_div': 0.0, 'total_loss': 0.0}
         
@@ -1464,25 +2032,43 @@ class TrafficTrainer:
         old_log_probs = old_log_probs.to(device)
         rewards = rewards.to(device)
         
-        # Perform GRPO update
+        # Perform GRPO update with mixed precision
         if self.grpo:
-            loss_dict = self.grpo.update(states, actions, old_log_probs, rewards, self.trajectory)
+            loss_dict = self.grpo.update(states, actions, old_log_probs, rewards, self.trajectory, 
+                                       use_mixed_precision=self.use_mixed_precision, scaler=self.scaler)
         else:
-            # Fallback for discrete transformer
+            # Fallback for discrete transformer with mixed precision
             self.policy_net.train()
-            current_q_values, _ = self.policy_net(states)
-            current_q_values = current_q_values.gather(1, actions.long().unsqueeze(1))
             
-            # Simple policy gradient for discrete case
-            returns = self.compute_returns(rewards)
-            loss = -torch.mean(current_q_values.squeeze() * returns)
+            if self.use_mixed_precision and self.scaler:
+                with torch.cuda.amp.autocast():
+                    current_q_values, _ = self.policy_net(states)
+                    current_q_values = current_q_values.gather(1, actions.long().unsqueeze(1))
+                    
+                    # Simple policy gradient for discrete case
+                    returns = self.compute_returns(rewards)
+                    loss = -torch.mean(current_q_values.squeeze() * returns)
+                
+                self.optimizer.zero_grad()
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                current_q_values, _ = self.policy_net(states)
+                current_q_values = current_q_values.gather(1, actions.long().unsqueeze(1))
+                
+                # Simple policy gradient for discrete case
+                returns = self.compute_returns(rewards)
+                loss = -torch.mean(current_q_values.squeeze() * returns)
+                
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
+                self.optimizer.step()
             
-            self.optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
-            self.optimizer.step()
             self.policy_net.eval()
-            
             loss_dict = {'policy_loss': loss.item(), 'kl_div': 0.0, 'total_loss': loss.item()}
         
         # Clear trajectory
@@ -1502,8 +2088,9 @@ class TrafficTrainer:
         """Run GRPO training episode"""
         self.current_episode = episode_num  # Track current episode for debugging
         self.vehicles = []
-        # Spawn MORE vehicles to test real automated traffic scenario
-        for _ in range(25):  # Increased from 12 to 25 vehicles
+        # Spawn MORE vehicles to fully utilize GPU processing power
+        num_vehicles = 40 if torch.cuda.is_available() else 25  # More vehicles for GPU training
+        for _ in range(num_vehicles):
             vehicle = self.spawn_vehicle()
             if vehicle:
                 self.vehicles.append(vehicle)
@@ -1517,6 +2104,22 @@ class TrafficTrainer:
         dt = 1/60  # Fixed 60 FPS to match simulation target
         
         for step in range(episode_length):
+            # Handle visualization events to prevent GUI freezing
+            if viz:
+                if hasattr(viz, 'handle_events'):
+                    # Panda3D visualization
+                    if not viz.handle_events():
+                        print("🛑 Training stopped by user")
+                        return {'avg_reward': 0, 'avg_loss': 0, 'throughput': 0, 'trajectory_size': 0, 'training_steps': 0}
+                else:
+                    # Pygame visualization
+                    for event in pygame.event.get():
+                        if event.type == pygame.QUIT:
+                            return {'avg_reward': 0, 'avg_loss': 0, 'throughput': 0, 'trajectory_size': 0, 'training_steps': 0}
+                        elif event.type == pygame.KEYDOWN:
+                            if event.key == pygame.K_ESCAPE:
+                                return {'avg_reward': 0, 'avg_loss': 0, 'throughput': 0, 'trajectory_size': 0, 'training_steps': 0}
+            
             # Update intersection managers
             for intersection in self.intersections:
                 intersection['manager'].current_time += dt
@@ -1580,8 +2183,9 @@ class TrafficTrainer:
                            if not (v.x < 50 or v.x > 1150 or v.y < 50 or v.y > 750)]
             vehicles_passed += initial_count - len(self.vehicles)
             
-            # Maintain HIGH vehicle count for automated traffic test
-            if len(self.vehicles) < 35 and step % 10 == 0:  # Increased target from 20 to 35
+            # Maintain HIGH vehicle count for GPU utilization
+            target_vehicles = 50 if torch.cuda.is_available() else 35
+            if len(self.vehicles) < target_vehicles and step % 10 == 0:
                 new_vehicle = self.spawn_vehicle()
                 if new_vehicle:
                     self.vehicles.append(new_vehicle)
@@ -1629,9 +2233,29 @@ class TrafficTrainer:
                 else:
                     print(f"T+{step/60:.0f}s: No vehicles present")
                 
-            # Update visualization periodically
-            if viz and step % 10 == 0:
+            # Update visualization less frequently for better performance
+            if viz and step % 30 == 0:  # Update every 30 steps (2 times per second) instead of 5
                 viz.update_display(self.vehicles, self.intersections)
+            
+            # Handle events more frequently than visualization updates for responsiveness
+            if viz and step % 3 == 0:  # Check events every 3 steps (20 times per second)
+                if hasattr(viz, 'handle_events'):
+                    # Panda3D visualization
+                    if not viz.handle_events():
+                        print("🛑 Training stopped by user")
+                        return {'avg_reward': 0, 'avg_loss': 0, 'throughput': 0, 'trajectory_size': 0, 'training_steps': 0}
+                else:
+                    # Pygame visualization
+                    for event in pygame.event.get():
+                        if event.type == pygame.QUIT:
+                            return {'avg_reward': 0, 'avg_loss': 0, 'throughput': 0, 'trajectory_size': 0, 'training_steps': 0}
+                        elif event.type == pygame.KEYDOWN:
+                            if event.key == pygame.K_ESCAPE:
+                                return {'avg_reward': 0, 'avg_loss': 0, 'throughput': 0, 'trajectory_size': 0, 'training_steps': 0}
+                
+                # Smaller delay for better performance
+                import time
+                time.sleep(0.0001)  # 0.1ms delay instead of 1ms
         
         # Final GRPO update with remaining trajectory
         if self.trajectory:
@@ -1647,13 +2271,23 @@ class TrafficTrainer:
             'training_steps': training_steps
         }
     
-    def train(self, episodes: int = 100, use_visualization: bool = True):
-        """Train the model with optional pygame visualization"""
+    def train(self, episodes: int = 100, use_visualization: bool = True, use_3d: bool = None):
+        """Train the model with optional visualization (2D pygame or 3D Panda3D)"""
         if use_visualization:
-            # Initialize pygame visualization
-            viz = TrainingVisualization()
-            viz.start_training(episodes)
-            console.print("🎮 [bold green]Training with live visualization[/bold green] - watch the learning process!")
+            # Auto-detect best visualization
+            if use_3d is None:
+                use_3d = PANDA3D_AVAILABLE
+            
+            if use_3d and PANDA3D_AVAILABLE:
+                # Initialize Panda3D 3D visualization
+                viz = Panda3DVisualization()
+                viz.start_training(episodes)
+                console.print("🎮 [bold green]Training with immersive 3D visualization[/bold green] - watch neural networks learn!")
+            else:
+                # Initialize pygame 2D visualization
+                viz = TrainingVisualization()
+                viz.start_training(episodes)
+                console.print("🎮 [bold green]Training with live 2D visualization[/bold green] - watch the learning process!")
         else:
             viz = None
             console.print(Panel.fit(
@@ -1797,7 +2431,10 @@ class TrafficTrainer:
         print(f"Best performance: {best_performance:.2f} (episode {best_episode})")
         final_reward = last_results['avg_reward'] if 'last_results' in locals() else 0.0
         print(f"Final reward: {final_reward:.2f}")
-        print(f"Total training steps: {sum(r.get('training_steps', 0) for r in [last_results] if 'last_results' in locals())}")
+        if 'last_results' in locals():
+            print(f"Total training steps: {last_results.get('training_steps', 0)}")
+        else:
+            print(f"Total training steps: 0")
         
         # Learning assessment
         if len(self.training_history['rewards']) >= 20:
@@ -1978,7 +2615,7 @@ TRAINING SUMMARY
 # ============================================================================
 
 class TrafficSimulation:
-    """Interactive traffic simulation"""
+    """Interactive traffic simulation with 2D pygame"""
     def __init__(self, model_path: str = 'traffic_transformer_coord_advanced.pth'):
         pygame.init()
         self.screen = pygame.display.set_mode((1600, 1000))  # Higher resolution for better quality
@@ -2299,30 +2936,612 @@ class TrafficSimulation:
         
         pygame.quit()
 
+class TrafficSimulation3D(ShowBase):
+    """Interactive 3D traffic simulation using Panda3D"""
+    def __init__(self, model_path: str = 'traffic_transformer_coord_advanced.pth'):
+        if not PANDA3D_AVAILABLE:
+            raise ImportError("Panda3D not available. Install with: pip install panda3d")
+        
+        # Initialize Panda3D ShowBase
+        ShowBase.__init__(self)
+        
+        # Window configuration
+        props = WindowProperties()
+        props.setTitle("🚗 Autonomous Vehicle 3D Coordination Simulation")
+        props.setSize(1600, 900)
+        self.win.requestProperties(props)
+        
+        # Camera setup - bird's eye view for traffic monitoring
+        self.camera.setPos(600, -800, 400)
+        self.camera.lookAt(600, 400, 0)
+        
+        # Initialize simulation-specific attributes
+        self.running = True
+        self.total_time = 0
+        self.metrics = {'throughput': 0, 'cooperation': 0}
+        self.vehicle_nodes = {}
+        self.intersection_nodes = []
+        
+        # Setup 3D environment
+        self.setup_lighting()
+        self.setup_environment()
+        self.setup_ui()
+        self.setup_camera_controls()
+        
+        # Load trained model
+        try:
+            checkpoint = torch.load(model_path, map_location='cpu')
+            # Try to determine model type from checkpoint
+            if 'use_advanced_ml' in checkpoint and checkpoint['use_advanced_ml']:
+                self.policy_net = AdvancedTrafficTransformer(continuous_actions=True)
+                self.use_advanced_ml = True
+            else:
+                # Fallback to discrete transformer
+                self.policy_net = TrafficTransformer()
+                self.use_advanced_ml = False
+            
+            self.policy_net.load_state_dict(checkpoint['model_state_dict'])
+            self.policy_net.eval()
+            print(f"✓ Loaded trained {'advanced' if self.use_advanced_ml else 'basic'} model from {model_path}")
+        except FileNotFoundError:
+            print(f"❌ No model found at {model_path}")
+            print("Run training first!")
+            self.running = False
+            return
+        except Exception as e:
+            print(f"❌ Error loading model: {e}")
+            print("Using basic model as fallback...")
+            self.policy_net = TrafficTransformer()
+            self.use_advanced_ml = False
+        
+        # Replace the vehicles list with simulation vehicles
+        self.vehicles = []
+        
+        # Initialize intersection managers for simulation
+        self.intersection_managers = [
+            IntersectionManager(400, 300),
+            IntersectionManager(800, 300), 
+            IntersectionManager(400, 500),
+            IntersectionManager(800, 500)
+        ]
+        
+        # Update display metadata for rendering (override parent's intersection_display)
+        for i, manager in enumerate(self.intersection_managers):
+            if i < len(self.intersection_nodes):
+                self.intersection_nodes[i]['occupancy'] = 0
+        
+        # Override UI for simulation mode
+        self.setup_simulation_ui()
+        
+        # Spawn initial vehicles - HIGH DENSITY for "all vehicles automated" test
+        for _ in range(25):
+            self.spawn_vehicle()
+        
+        # Add simulation controls
+        self.accept("space", self.add_vehicles)
+        self.accept("escape", self.exit_simulation)
+        
+        # Start simulation loop
+        self.taskMgr.add(self.simulation_update, "simulation_update")
+    
+    def setup_lighting(self):
+        """Create realistic lighting for the 3D scene"""
+        # Ambient light for overall illumination
+        ambient_light = AmbientLight('ambient')
+        ambient_light.setColor((0.3, 0.3, 0.4, 1))
+        ambient_np = self.render.attachNewNode(ambient_light)
+        self.render.setLight(ambient_np)
+        
+        # Directional light (sun) for shadows and depth
+        sun_light = DirectionalLight('sun')
+        sun_light.setColor((0.8, 0.8, 0.7, 1))
+        sun_light.setDirection(Vec3(-1, -1, -0.5))
+        sun_np = self.render.attachNewNode(sun_light)
+        sun_np.setPos(600, 400, 500)
+        self.render.setLight(sun_np)
+        
+        # Additional point lights at intersections for better visibility
+        for i, pos in enumerate([(400, 300), (800, 300), (400, 500), (800, 500)]):
+            point_light = PointLight(f'intersection_light_{i}')
+            point_light.setColor((0.4, 0.4, 0.5, 1))
+            point_np = self.render.attachNewNode(point_light)
+            point_np.setPos(pos[0], pos[1], 50)
+            self.render.setLight(point_np)
+        
+        # Atmospheric fog for depth perception
+        fog = Fog('atmosphere')
+        fog.setColor(0.8, 0.8, 0.9)
+        fog.setExpDensity(0.0008)
+        self.render.setFog(fog)
+    
+    def setup_environment(self):
+        """Create the 3D road environment"""
+        # Ground plane
+        ground = self.create_ground_plane()
+        ground.reparentTo(self.render)
+        
+        # Road system
+        self.create_road_system()
+        
+        # Intersections
+        self.create_intersections()
+        
+        # Environmental elements
+        self.create_environment_details()
+    
+    def create_ground_plane(self):
+        """Create a textured ground plane"""
+        cm = CardMaker('ground')
+        cm.setFrame(-100, 1300, -100, 900)  # Large ground area
+        ground = self.render.attachNewNode(cm.generate())
+        ground.setP(-90)  # Rotate to be horizontal
+        ground.setColor(0.2, 0.4, 0.2, 1)  # Dark green grass
+        
+        # Add subtle texture variation
+        ground.setTexScale(TextureStage.getDefault(), 50, 50)
+        return ground
+    
+    def create_road_system(self):
+        """Create 3D road network"""
+        # Road material properties
+        road_color = (0.3, 0.3, 0.35, 1)
+        lane_line_color = (0.9, 0.9, 0.9, 1)
+        
+        # Horizontal roads
+        for y in [300, 500]:
+            road = self.create_road_segment(0, y-30, 1200, 60, road_color)
+            road.reparentTo(self.render)
+            
+            # Lane markings
+            for x in range(50, 1200, 40):
+                marking = self.create_lane_marking(x, y, 20, 2, lane_line_color)
+                marking.reparentTo(self.render)
+        
+        # Vertical roads  
+        for x in [400, 800]:
+            road = self.create_road_segment(x-30, 0, 60, 800, road_color)
+            road.reparentTo(self.render)
+            
+            # Lane markings
+            for y in range(50, 800, 40):
+                marking = self.create_lane_marking(x, y, 2, 20, lane_line_color)
+                marking.reparentTo(self.render)
+    
+    def create_road_segment(self, x, y, width, height, color):
+        """Create a single road segment"""
+        cm = CardMaker('road')
+        cm.setFrame(0, width, 0, height)
+        road = self.render.attachNewNode(cm.generate())
+        road.setPos(x, y, 0.1)  # Slightly above ground
+        road.setColor(*color)
+        road.setP(-90)  # Make horizontal
+        return road
+    
+    def create_lane_marking(self, x, y, width, height, color):
+        """Create lane markings"""
+        cm = CardMaker('lane_marking')
+        cm.setFrame(-width/2, width/2, -height/2, height/2)
+        marking = self.render.attachNewNode(cm.generate())
+        marking.setPos(x, y, 0.2)  # Above road surface
+        marking.setColor(*color)
+        marking.setP(-90)
+        return marking
+    
+    def create_intersections(self):
+        """Create 3D intersection visualizations"""
+        intersection_positions = [(400, 300), (800, 300), (400, 500), (800, 500)]
+        
+        for i, (x, y) in enumerate(intersection_positions):
+            # Intersection platform
+            cm = CardMaker(f'intersection_{i}')
+            cm.setFrame(-40, 40, -40, 40)
+            intersection = self.render.attachNewNode(cm.generate())
+            intersection.setPos(x, y, 0.15)
+            intersection.setColor(0.4, 0.4, 0.4, 1)  # Darker intersection color
+            intersection.setP(-90)
+            
+            # Traffic coordination indicator (will change color based on occupancy)
+            indicator = self.create_traffic_indicator(x, y)
+            indicator.reparentTo(self.render)
+            
+            self.intersection_nodes.append({
+                'node': intersection,
+                'indicator': indicator,
+                'position': (x, y),
+                'occupancy': 0
+            })
+    
+    def create_traffic_indicator(self, x, y):
+        """Create traffic coordination status indicator"""
+        cm = CardMaker('indicator')
+        cm.setFrame(-5, 5, -5, 5)
+        indicator = self.render.attachNewNode(cm.generate())
+        indicator.setPos(x, y, 20)  # Elevated above intersection
+        indicator.setColor(0, 1, 0, 0.7)  # Green = clear
+        indicator.setTransparency(TransparencyAttrib.MAlpha)
+        indicator.setP(-90)
+        indicator.setBillboardAxis()  # Always face camera
+        return indicator
+    
+    def create_environment_details(self):
+        """Add environmental details for immersion"""
+        # Simple buildings/structures around the road network
+        building_positions = [
+            (200, 150, 30), (600, 150, 25), (1000, 150, 35),
+            (200, 650, 28), (600, 650, 32), (1000, 650, 30),
+            (150, 400, 20), (1050, 400, 25)
+        ]
+        
+        for i, (x, y, height) in enumerate(building_positions):
+            building = self.create_building(x, y, height)
+            building.reparentTo(self.render)
+    
+    def create_building(self, x, y, height):
+        """Create simple building structures"""
+        cm = CardMaker('building')
+        cm.setFrame(-15, 15, 0, height)
+        building = self.render.attachNewNode(cm.generate())
+        building.setPos(x, y, 0)
+        building.setColor(0.6, 0.6, 0.7, 1)
+        building.lookAt(600, 400, 0)  # Face toward center
+        return building
+    
+    def create_vehicle_model(self, vehicle_id: int):
+        """Create 3D vehicle model"""
+        # Create vehicle body
+        cm = CardMaker(f'vehicle_{vehicle_id}')
+        cm.setFrame(-6, 6, -3, 3)  # 12x6 meter vehicle
+        vehicle_node = self.render.attachNewNode(cm.generate())
+        vehicle_node.setColor(0.8, 0.2, 0.2, 1)  # Red vehicle
+        vehicle_node.setP(-90)  # Make horizontal
+        vehicle_node.setZ(1)  # Slightly above road
+        
+        # Add vehicle details
+        # Windshield
+        windshield = CardMaker('windshield')
+        windshield.setFrame(-4, 4, -2, 2)
+        windshield_node = vehicle_node.attachNewNode(windshield.generate())
+        windshield_node.setPos(0, 0, 2)
+        windshield_node.setColor(0.2, 0.2, 0.4, 0.8)
+        windshield_node.setTransparency(TransparencyAttrib.MAlpha)
+        
+        # Direction indicator
+        indicator = CardMaker('direction')
+        indicator.setFrame(-1, 1, -1, 1)
+        indicator_node = vehicle_node.attachNewNode(indicator.generate())
+        indicator_node.setPos(5, 0, 1)  # Front of vehicle
+        indicator_node.setColor(1, 1, 1, 1)  # White
+        
+        return vehicle_node
+    
+    def setup_ui(self):
+        """Setup 3D UI elements"""
+        # Title
+        self.title_text = OnscreenText(
+            text="🚗 Autonomous Vehicle 3D Coordination Simulation",
+            pos=(0, 0.9), scale=0.08, fg=(1, 1, 1, 1),
+            align=TextNode.ACenter, mayChange=True
+        )
+        
+        # Controls help
+        self.controls_text = OnscreenText(
+            text="Controls: Mouse = Rotate | Wheel = Zoom | SPACE = Add vehicles | ESC = Exit",
+            pos=(0, -0.9), scale=0.04, fg=(0.8, 0.8, 0.8, 1),
+            align=TextNode.ACenter, mayChange=False
+        )
+        
+        # Add simulation-specific stats
+        self.simulation_text = OnscreenText(
+            text="", pos=(0.6, 0.8), scale=0.05, fg=(0.8, 1, 1, 1),
+            align=TextNode.ALeft, mayChange=True
+        )
+    
+    def setup_camera_controls(self):
+        """Setup interactive camera controls"""
+        # Mouse camera control
+        self.camera_pivot = self.render.attachNewNode("camera_pivot")
+        self.camera_pivot.setPos(600, 400, 0)  # Center of scene
+        
+        # Accept mouse events
+        self.accept("mouse1", self.start_camera_rotate)
+        self.accept("mouse1-up", self.stop_camera_rotate)
+        self.accept("wheel_up", self.zoom_in)
+        self.accept("wheel_down", self.zoom_out)
+        
+        self.camera_rotating = False
+        self.last_mouse_pos = None
+    
+    def start_camera_rotate(self):
+        """Start camera rotation"""
+        self.camera_rotating = True
+        self.last_mouse_pos = None
+    
+    def stop_camera_rotate(self):
+        """Stop camera rotation"""
+        self.camera_rotating = False
+    
+    def zoom_in(self):
+        """Zoom camera in"""
+        current_pos = self.camera.getPos()
+        center = Vec3(600, 400, 0)
+        direction = current_pos - center
+        direction.normalize()
+        new_pos = current_pos - direction * 50
+        self.camera.setPos(new_pos)
+    
+    def zoom_out(self):
+        """Zoom camera out"""
+        current_pos = self.camera.getPos()
+        center = Vec3(600, 400, 0)
+        direction = current_pos - center
+        direction.normalize()
+        new_pos = current_pos + direction * 50
+        self.camera.setPos(new_pos)
+    
+    def update_vehicles(self, vehicles: List):
+        """Update 3D vehicle positions and states"""
+        current_vehicle_ids = set(v.id for v in vehicles)
+        
+        # Remove vehicles that no longer exist
+        for vehicle_id in list(self.vehicle_nodes.keys()):
+            if vehicle_id not in current_vehicle_ids:
+                self.vehicle_nodes[vehicle_id].removeNode()
+                del self.vehicle_nodes[vehicle_id]
+        
+        # Update existing vehicles and create new ones
+        for vehicle in vehicles:
+            if vehicle.id not in self.vehicle_nodes:
+                # Create new vehicle
+                self.vehicle_nodes[vehicle.id] = self.create_vehicle_model(vehicle.id)
+            
+            # Update vehicle position and orientation
+            vehicle_node = self.vehicle_nodes[vehicle.id]
+            vehicle_node.setPos(vehicle.x, vehicle.y, 1)
+            vehicle_node.setH(math.degrees(-vehicle.heading) + 90)  # Convert to Panda3D heading
+            
+            # Color based on behavior and state
+            if vehicle.behavior_mode == 'cooperative':
+                color = (0.2, 0.8, 0.2, 1)  # Green for cooperative
+            elif vehicle.collision_risk > 0.5:
+                color = (1, 0.5, 0, 1)  # Orange for high risk
+            elif vehicle.speed < 5:
+                color = (0.8, 0.8, 0.2, 1)  # Yellow for slow
+            else:
+                color = (0.2, 0.5, 1, 1)  # Blue for normal
+            
+            vehicle_node.setColor(*color)
+            
+            # Scale based on speed (visual feedback)
+            speed_scale = 1.0 + (vehicle.speed / 45.0) * 0.3
+            vehicle_node.setScale(speed_scale, 1, 1)
+    
+    def update_intersections(self, intersections: List):
+        """Update intersection status indicators"""
+        for i, intersection_data in enumerate(intersections):
+            if i < len(self.intersection_nodes):
+                # Calculate occupancy
+                occupancy = intersection_data.get('occupancy', 0)
+                
+                # Update indicator color based on traffic
+                indicator = self.intersection_nodes[i]['indicator']
+                if occupancy > 3:
+                    indicator.setColor(1, 0, 0, 0.8)  # Red - congested
+                elif occupancy > 1:
+                    indicator.setColor(1, 0.5, 0, 0.8)  # Orange - moderate
+                elif occupancy > 0:
+                    indicator.setColor(1, 1, 0, 0.8)  # Yellow - light traffic
+                else:
+                    indicator.setColor(0, 1, 0, 0.7)  # Green - clear
+                
+                # Animate indicator based on activity
+                scale = 1.0 + occupancy * 0.2
+                indicator.setScale(scale)
+    
+    def setup_simulation_ui(self):
+        """Override UI for simulation mode"""
+        # Update title for simulation
+        self.title_text.setText("🚗 Autonomous Vehicle 3D Coordination Simulation")
+        
+        # Update controls text
+        self.controls_text.setText("Controls: Mouse = Rotate | Wheel = Zoom | SPACE = Add vehicles | ESC = Exit")
+        
+        # Add simulation-specific stats
+        self.simulation_text = OnscreenText(
+            text="", pos=(0.6, 0.8), scale=0.05, fg=(0.8, 1, 1, 1),
+            align=TextNode.ALeft, mayChange=True
+        )
+    
+    def spawn_vehicle(self):
+        """Spawn vehicle with trained model - collision-free"""
+        # Entry points (adjusted for the simulation coordinate system)
+        lane_offset = 3.0
+        entry_points = [
+            (150, 300 - lane_offset, 0),    # West entrance, heading East
+            (1050, 300 + lane_offset, math.pi),  # East entrance, heading West
+            (150, 500 - lane_offset, 0),    # West entrance, heading East
+            (1050, 500 + lane_offset, math.pi),  # East entrance, heading West
+            (400 + lane_offset, 150, math.pi/2),   # North entrance, heading South
+            (400 - lane_offset, 650, -math.pi/2),  # South entrance, heading North
+            (800 + lane_offset, 150, math.pi/2),   # North entrance, heading South
+            (800 - lane_offset, 650, -math.pi/2),  # South entrance, heading North
+        ]
+        
+        max_attempts = 30
+        
+        for attempt in range(max_attempts):
+            x, y, heading = random.choice(entry_points)
+            
+            # Add variation to spread out spawning
+            if heading == 0 or heading == math.pi:
+                x += random.uniform(-25, 25)
+                y += random.uniform(-1.5, 1.5)
+            else:
+                x += random.uniform(-1.5, 1.5)
+                y += random.uniform(-25, 25)
+            
+            # Check for collisions
+            collision_free = True
+            min_distance = 25.0
+            
+            for existing_vehicle in self.vehicles:
+                distance = math.sqrt((existing_vehicle.x - x)**2 + (existing_vehicle.y - y)**2)
+                if distance < min_distance:
+                    collision_free = False
+                    break
+            
+            if collision_free:
+                vehicle = AutonomousVehicle(x, y, heading)
+                vehicle.speed = random.uniform(25.0, 35.0)
+                
+                if self.use_advanced_ml:
+                    vehicle.policy_net = self.policy_net
+                    vehicle._all_vehicles = self.vehicles
+                else:
+                    vehicle.transformer = self.policy_net
+                vehicle.target_speed = random.uniform(35, 42)
+                self.vehicles.append(vehicle)
+                return
+        
+        if len(self.vehicles) < 5:
+            print(f"Warning: Could not find collision-free spawn point after {max_attempts} attempts")
+    
+    def simulation_update(self, task):
+        """Main simulation update loop"""
+        dt = task.time - getattr(self, '_last_time', 0)
+        self._last_time = task.time
+        dt = min(dt, 1/30.0)  # Cap at 30 FPS minimum
+        self.total_time += dt
+        
+        # Update intersection managers
+        for manager in self.intersection_managers:
+            manager.update(dt)
+        
+        # Update intersection occupancy for visualization
+        for i, intersection_node in enumerate(self.intersection_nodes):
+            if i < len(self.intersection_managers):
+                occupancy = sum(
+                    1 for v in self.vehicles 
+                    if math.sqrt((v.x - intersection_node['position'][0])**2 + 
+                               (v.y - intersection_node['position'][1])**2) < 50
+                )
+                intersection_node['occupancy'] = occupancy
+        
+        # Update vehicles with manager objects
+        for vehicle in self.vehicles:
+            vehicle.update(dt, self.vehicles, self.intersection_managers)
+            
+            if vehicle.behavior_mode == 'cooperative':
+                self.metrics['cooperation'] += dt
+        
+        # Remove exited vehicles
+        initial_count = len(self.vehicles)
+        self.vehicles = [v for v in self.vehicles 
+                        if not (v.x < 50 or v.x > 1150 or v.y < 50 or v.y > 750)]
+        self.metrics['throughput'] += initial_count - len(self.vehicles)
+        
+        # Maintain traffic flow
+        if len(self.vehicles) < 35 and random.random() < 0.03:
+            self.spawn_vehicle()
+        
+        # Update 3D visualization
+        self.update_vehicles(self.vehicles)
+        self.update_intersections(self.intersection_nodes)
+        
+        # Update simulation stats
+        self.update_simulation_stats()
+        
+        return task.cont
+    
+    def update_simulation_stats(self):
+        """Update simulation-specific statistics"""
+        throughput_rate = (self.metrics['throughput'] / max(1, self.total_time)) * 60
+        cooperation_rate = self.metrics['cooperation'] / max(1, self.total_time)
+        avg_speed = np.mean([v.speed for v in self.vehicles]) if self.vehicles else 0
+        avg_collision_risk = np.mean([v.collision_risk for v in self.vehicles]) if self.vehicles else 0
+        
+        simulation_text = f"""🚗 Active Vehicles: {len(self.vehicles)}
+📊 Throughput: {throughput_rate:.1f}/min
+🤝 Cooperation: {cooperation_rate:.2f}/s
+⚡ Avg Speed: {avg_speed:.1f} m/s
+⚠️ Collision Risk: {avg_collision_risk:.1%}
+⏱️ Runtime: {self.total_time:.1f}s"""
+        
+        self.simulation_text.setText(simulation_text)
+        
+        # Performance assessment for metrics display
+        self.training_metrics.update({
+            'vehicles': len(self.vehicles),
+            'throughput': int(throughput_rate),
+            'cooperation': cooperation_rate,
+            'collision_risk': avg_collision_risk,
+            'reward': throughput_rate / 10.0  # Convert to reward-like metric
+        })
+    
+    def add_vehicles(self):
+        """Add 5 more vehicles (SPACE key)"""
+        for _ in range(5):
+            self.spawn_vehicle()
+        print(f"➕ Added 5 vehicles (Total: {len(self.vehicles)})")
+    
+    def exit_simulation(self):
+        """Exit simulation (ESC key)"""
+        self.running = False
+        self.userExit = True
+    
+    def run_simulation(self):
+        """Run the 3D simulation"""
+        print("🚗 3D Autonomous Vehicle Coordination Simulation")
+        print("=" * 60)
+        print("Immersive 3D visualization with Panda3D!")
+        print("Watch vehicles coordinate at intersections without traffic lights!")
+        print("Using trained transformer neural networks + Kalman filters")
+        print("=" * 60)
+        print("\n🎮 Controls:")
+        print("   Mouse Drag = Rotate camera")
+        print("   Mouse Wheel = Zoom in/out")
+        print("   SPACE = Add 5 more vehicles")
+        print("   ESC   = Exit simulation")
+        print("\n🚀 Starting 3D simulation...")
+        
+        # Start Panda3D main loop
+        self.run()
+
 # ============================================================================
 # GRAPH NEURAL NETWORK FOR VEHICLE RELATIONSHIPS
 # ============================================================================
 
-class VehicleGraphNet(nn.Module):
-    """Graph Neural Network for modeling vehicle interactions"""
-    def __init__(self, node_features: int = 32, edge_features: int = 16, 
-                 hidden_dim: int = 128, num_layers: int = 3):
+class GraphSAGEVehicleNet(nn.Module):
+    """GraphSAGE for vehicle relationship modeling - 2024-2025 optimized
+    - 15-25 neighbors per node
+    - Hidden dimensions 128-256
+    - Mean aggregation (best for AV scenarios)
+    """
+    def __init__(self, node_features: int = 32, hidden_dim: int = 128, 
+                 num_neighbors: int = 20, num_layers: int = 3):
         super().__init__()
         self.node_features = node_features
-        self.edge_features = edge_features
         self.hidden_dim = hidden_dim
+        self.num_neighbors = num_neighbors  # Optimized 15-25 range
+        self.edge_features = 7  # Number of edge features we're using
         
-        # Node feature encoding
+        # Node feature encoding with batch norm
         self.node_encoder = nn.Sequential(
             nn.Linear(node_features, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
             nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(hidden_dim, hidden_dim)
         )
         
-        # Graph attention layers
-        self.gat_layers = nn.ModuleList([
-            GATConv(hidden_dim, hidden_dim // 8, heads=8, dropout=0.1)
+        # GraphSAGE layers with mean aggregation (optimal for AV)
+        self.sage_layers = nn.ModuleList([
+            SAGEConv(hidden_dim, hidden_dim, aggr='mean', normalize=True)
             for _ in range(num_layers)
+        ])
+        
+        # Layer normalization for each SAGE layer
+        self.layer_norms = nn.ModuleList([
+            nn.LayerNorm(hidden_dim) for _ in range(num_layers)
         ])
         
         # Communication network
@@ -2380,8 +3599,6 @@ class VehicleGraphNet(nn.Module):
             ]
             node_features.append(features[:self.node_features])
         
-        x = torch.FloatTensor(node_features)
-        
         # Create edges based on spatial proximity and interaction potential
         edge_indices = []
         edge_attrs = []
@@ -2418,21 +3635,26 @@ class VehicleGraphNet(nn.Module):
         if not edge_indices:
             return None
             
-        edge_index = torch.LongTensor(edge_indices).t().contiguous()
-        edge_attr = torch.FloatTensor(edge_attrs)
+        # Get device from model parameters and ensure all tensors are on same device
+        device = next(self.node_encoder.parameters()).device
+        x = torch.FloatTensor(node_features).to(device)
+        edge_index = torch.LongTensor(edge_indices).t().contiguous().to(device)
+        edge_attr = torch.FloatTensor(edge_attrs).to(device)
         
         return Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
     
     def forward(self, graph_data: Data) -> torch.Tensor:
         """Forward pass through graph network"""
         if graph_data is None:
-            return torch.zeros(1, 64)  # Return default if no graph
+            device = next(self.node_encoder.parameters()).device
+            return torch.zeros(1, 64, device=device)  # Return default if no graph
             
         x = self.node_encoder(graph_data.x)
         
-        # Apply graph attention layers
-        for gat_layer in self.gat_layers:
-            x = F.relu(gat_layer(x, graph_data.edge_index))
+        # Apply GraphSAGE layers
+        for i, sage_layer in enumerate(self.sage_layers):
+            x = F.relu(sage_layer(x, graph_data.edge_index))
+            x = self.layer_norms[i](x)
             x = F.dropout(x, training=self.training)
         
         # Generate communication embeddings
@@ -2453,53 +3675,173 @@ class VehicleGraphNet(nn.Module):
 # ============================================================================
 
 class GRPO:
-    """Group Relative Policy Optimization - Advanced RL without critic"""
-    def __init__(self, policy_net, optimizer, group_size: int = 8, 
-                 kl_coeff: float = 0.02, clip_ratio: float = 0.2):
+    """Group Relative Policy Optimization - Advanced RL without critic
+    Optimized parameters based on 2024-2025 advances:
+    - Group sizes: 4-8 responses per query
+    - Clip epsilon: 0.2
+    - Learning rates: 1e-5 to 5e-5
+    """
+    def __init__(self, policy_net, optimizer, group_size: int = 6, 
+                 kl_coeff: float = 0.015, clip_ratio: float = 0.2):
         self.policy_net = policy_net
         self.optimizer = optimizer
-        self.group_size = group_size
+        self.group_size = group_size  # Optimized 4-8 range
         self.kl_coeff = kl_coeff
-        self.clip_ratio = clip_ratio
+        self.clip_ratio = clip_ratio  # Standard 0.2 clip epsilon
         self.ref_policy = None
+        self.group_stats_buffer = deque(maxlen=1000)  # Track group statistics
         
     def set_reference_policy(self, ref_policy):
         """Set reference policy for KL divergence"""
         self.ref_policy = ref_policy
         
     def compute_advantages(self, rewards: torch.Tensor) -> torch.Tensor:
-        """Compute group-relative advantages"""
-        # Group normalization
+        """Compute group-relative advantages with improved stability"""
+        # Enhanced group normalization with running statistics
         group_mean = torch.mean(rewards)
         group_std = torch.std(rewards) + 1e-8
+        
+        # Store group statistics for analysis
+        self.group_stats_buffer.append({
+            'mean': group_mean.item(),
+            'std': group_std.item(),
+            'size': len(rewards)
+        })
+        
+        # Improved advantage computation with clipping
         advantages = (rewards - group_mean) / group_std
+        advantages = torch.clamp(advantages, -5.0, 5.0)  # Prevent extreme values
         return advantages
         
-    def update(self, states, actions, old_log_probs, rewards, trajectory=None):
-        """GRPO update step"""
+    def update(self, states, actions, old_log_probs, rewards, trajectory=None, use_mixed_precision=False, scaler=None):
+        """GRPO update step with mixed precision support"""
         # Compute advantages using group statistics
         advantages = self.compute_advantages(rewards)
         
         # For continuous actions, we need to do a proper forward pass to get gradients
         if hasattr(self.policy_net, 'continuous_actions') and self.policy_net.continuous_actions and trajectory:
-            # Get the current log probabilities by re-running the network
-            current_log_probs = []
-            
-            for i, traj_data in enumerate(trajectory):
-                vehicle = traj_data['vehicle']
-                all_vehicles = traj_data['all_vehicles']
-                action = traj_data['action']
+            if use_mixed_precision and scaler:
+                with torch.cuda.amp.autocast():
+                    # Get the current log probabilities by re-running the network
+                    current_log_probs = []
+                    
+                    for i, traj_data in enumerate(trajectory):
+                        vehicle = traj_data['vehicle']
+                        all_vehicles = traj_data['all_vehicles']
+                        action = traj_data['action']
+                        
+                        # Re-run the policy network
+                        comm_vector = torch.zeros(8).to(actions.device)
+                        mean, log_std = self.policy_net(all_vehicles, vehicle, comm_vector)
+                        std = torch.exp(log_std.clamp(-5, 2))
+                        dist = torch.distributions.Normal(mean, std)
+                        log_prob = dist.log_prob(action).sum()
+                        current_log_probs.append(log_prob)
+                    
+                    if current_log_probs:
+                        current_log_probs = torch.stack(current_log_probs)
+                        
+                        # Compute ratio
+                        ratio = torch.exp(current_log_probs - old_log_probs.detach())
+                        
+                        # Compute clipped objective
+                        surr1 = ratio * advantages
+                        surr2 = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * advantages
+                        policy_loss = -torch.min(surr1, surr2).mean()
+                        kl_div = torch.tensor(0.0)
+                        total_loss = policy_loss
+                    else:
+                        # Fallback if no valid trajectories
+                        policy_loss = torch.tensor(0.0, requires_grad=True)
+                        kl_div = torch.tensor(0.0)
+                        total_loss = policy_loss
                 
-                # Re-run the policy network
-                comm_vector = torch.zeros(8).to(actions.device)
-                mean, log_std = self.policy_net(all_vehicles, vehicle, comm_vector)
-                std = torch.exp(log_std.clamp(-5, 2))
-                dist = torch.distributions.Normal(mean, std)
-                log_prob = dist.log_prob(action).sum()
-                current_log_probs.append(log_prob)
-            
-            if current_log_probs:
-                current_log_probs = torch.stack(current_log_probs)
+                # Mixed precision backward pass
+                if total_loss.requires_grad:
+                    self.optimizer.zero_grad()
+                    scaler.scale(total_loss).backward()
+                    scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
+                    scaler.step(self.optimizer)
+                    scaler.update()
+            else:
+                # Regular precision for continuous actions
+                current_log_probs = []
+                
+                for i, traj_data in enumerate(trajectory):
+                    vehicle = traj_data['vehicle']
+                    all_vehicles = traj_data['all_vehicles']
+                    action = traj_data['action']
+                    
+                    # Re-run the policy network
+                    comm_vector = torch.zeros(8).to(actions.device)
+                    mean, log_std = self.policy_net(all_vehicles, vehicle, comm_vector)
+                    std = torch.exp(log_std.clamp(-5, 2))
+                    dist = torch.distributions.Normal(mean, std)
+                    log_prob = dist.log_prob(action).sum()
+                    current_log_probs.append(log_prob)
+                
+                if current_log_probs:
+                    current_log_probs = torch.stack(current_log_probs)
+                    
+                    # Compute ratio
+                    ratio = torch.exp(current_log_probs - old_log_probs.detach())
+                    
+                    # Compute clipped objective
+                    surr1 = ratio * advantages
+                    surr2 = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * advantages
+                    policy_loss = -torch.min(surr1, surr2).mean()
+                    kl_div = torch.tensor(0.0)
+                    total_loss = policy_loss
+                else:
+                    # Fallback if no valid trajectories
+                    policy_loss = torch.tensor(0.0, requires_grad=True)
+                    kl_div = torch.tensor(0.0)
+                    total_loss = policy_loss
+                
+                # Regular backward pass
+                if total_loss.requires_grad:
+                    self.optimizer.zero_grad()
+                    total_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
+                    self.optimizer.step()
+        else:
+            # Get current policy outputs for discrete actions
+            if use_mixed_precision and scaler:
+                with torch.cuda.amp.autocast():
+                    current_outputs = self.policy_net(states)
+                    current_log_probs = self.get_log_probs(current_outputs, actions)
+                    
+                    # Compute ratio
+                    ratio = torch.exp(current_log_probs - old_log_probs.detach())
+                    
+                    # Compute clipped objective
+                    surr1 = ratio * advantages
+                    surr2 = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * advantages
+                    policy_loss = -torch.min(surr1, surr2).mean()
+                    
+                    # KL divergence regularization
+                    if self.ref_policy is not None:
+                        ref_outputs = self.ref_policy(states)
+                        ref_log_probs = self.get_log_probs(ref_outputs, actions)
+                        kl_div = torch.mean(current_log_probs - ref_log_probs.detach())
+                        total_loss = policy_loss + self.kl_coeff * kl_div
+                    else:
+                        total_loss = policy_loss
+                        kl_div = torch.tensor(0.0)
+                
+                # Mixed precision backward pass
+                if total_loss.requires_grad:
+                    self.optimizer.zero_grad()
+                    scaler.scale(total_loss).backward()
+                    scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
+                    scaler.step(self.optimizer)
+                    scaler.update()
+            else:
+                # Regular precision for discrete actions
+                current_outputs = self.policy_net(states)
+                current_log_probs = self.get_log_probs(current_outputs, actions)
                 
                 # Compute ratio
                 ratio = torch.exp(current_log_probs - old_log_probs.detach())
@@ -2508,42 +3850,23 @@ class GRPO:
                 surr1 = ratio * advantages
                 surr2 = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * advantages
                 policy_loss = -torch.min(surr1, surr2).mean()
-                kl_div = torch.tensor(0.0)
-                total_loss = policy_loss
-            else:
-                # Fallback if no valid trajectories
-                policy_loss = torch.tensor(0.0, requires_grad=True)
-                kl_div = torch.tensor(0.0)
-                total_loss = policy_loss
-        else:
-            # Get current policy outputs for discrete actions
-            current_outputs = self.policy_net(states)
-            current_log_probs = self.get_log_probs(current_outputs, actions)
-            
-            # Compute ratio
-            ratio = torch.exp(current_log_probs - old_log_probs.detach())
-            
-            # Compute clipped objective
-            surr1 = ratio * advantages
-            surr2 = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * advantages
-            policy_loss = -torch.min(surr1, surr2).mean()
-            
-            # KL divergence regularization
-            if self.ref_policy is not None:
-                ref_outputs = self.ref_policy(states)
-                ref_log_probs = self.get_log_probs(ref_outputs, actions)
-                kl_div = torch.mean(current_log_probs - ref_log_probs.detach())
-                total_loss = policy_loss + self.kl_coeff * kl_div
-            else:
-                total_loss = policy_loss
-                kl_div = torch.tensor(0.0)
-        
-        # Only update if we have a loss that requires gradients
-        if total_loss.requires_grad:
-            self.optimizer.zero_grad()
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
-            self.optimizer.step()
+                
+                # KL divergence regularization
+                if self.ref_policy is not None:
+                    ref_outputs = self.ref_policy(states)
+                    ref_log_probs = self.get_log_probs(ref_outputs, actions)
+                    kl_div = torch.mean(current_log_probs - ref_log_probs.detach())
+                    total_loss = policy_loss + self.kl_coeff * kl_div
+                else:
+                    total_loss = policy_loss
+                    kl_div = torch.tensor(0.0)
+                
+                # Regular backward pass
+                if total_loss.requires_grad:
+                    self.optimizer.zero_grad()
+                    total_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
+                    self.optimizer.step()
         
         return {
             'policy_loss': policy_loss.item() if hasattr(policy_loss, 'item') else 0.0,
@@ -2608,7 +3931,8 @@ class VehicleCommunication:
     def aggregate_messages(self, vehicle) -> torch.Tensor:
         """Aggregate all received messages for a vehicle"""
         if not hasattr(vehicle, 'received_messages') or not vehicle.received_messages:
-            return torch.zeros(self.message_dim)
+            device = next(self.message_encoder.parameters()).device
+            return torch.zeros(self.message_dim, device=device)
             
         # Simple aggregation: mean of all messages
         messages = torch.stack(vehicle.received_messages)
@@ -2626,8 +3950,20 @@ class AdvancedTrafficTransformer(nn.Module):
         super().__init__()
         
         self.continuous_actions = continuous_actions
-        self.gnn = VehicleGraphNet()
-        self.communication = VehicleCommunication()
+        self.gnn = GraphSAGEVehicleNet(hidden_dim=128, num_neighbors=20)  # Optimized GraphSAGE
+        
+        # Communication networks as proper submodules
+        self.comm_message_encoder = nn.Sequential(
+            nn.Linear(32, 16),  # Vehicle state -> message
+            nn.Tanh(),
+            nn.Linear(16, 8)
+        )
+        
+        self.comm_message_decoder = nn.Sequential(
+            nn.Linear(8, 16),
+            nn.Tanh(),
+            nn.Linear(16, 8)  # Message -> action influence
+        )
         
         # Input projection
         self.input_projection = nn.Linear(gnn_features + 8, d_model)  # GNN + communication
@@ -2654,12 +3990,13 @@ class AdvancedTrafficTransformer(nn.Module):
         
         # Process communication
         if received_messages is None:
-            received_messages = torch.zeros(8)
+            device = gnn_output.device
+            received_messages = torch.zeros(8, device=device)
         
         # Ensure communication is on the right device
         device = gnn_output.device
         received_messages = received_messages.to(device)
-        comm_influence = self.communication.decode_message(received_messages)
+        comm_influence = self.comm_message_decoder(received_messages)
         comm_influence = comm_influence.to(device)  # Ensure same device
         
         # Combine GNN + communication
@@ -2687,49 +4024,64 @@ class AdvancedTrafficTransformer(nn.Module):
     def get_communication_message(self, vehicles: List, ego_vehicle) -> torch.Tensor:
         """Generate communication message based on current state"""
         # Encode ego vehicle state for communication
+        device = next(self.comm_message_encoder.parameters()).device
         ego_state = torch.FloatTensor([
             ego_vehicle.x / 1200.0, ego_vehicle.y / 800.0,
             ego_vehicle.speed / 45.0, ego_vehicle.acceleration / 8.0,
             ego_vehicle.heading / (2 * math.pi), ego_vehicle.collision_risk,
             ego_vehicle.lane_deviation() / 10.0, ego_vehicle.target_speed / 45.0,
             *[0.0] * 24  # Pad to 32 features
-        ])
-        return self.communication.encode_message(ego_state)
+        ]).to(device)
+        return self.comm_message_encoder(ego_state)
 
 # ============================================================================
 # MAIN INTERFACE
 # ============================================================================
 
 def main():
-    """Main interface with advanced ML options"""
-    print("🚗 Modern Autonomous Vehicle Traffic Simulation")
-    print("=" * 50)
+    """Main interface with advanced ML and 3D visualization options"""
+    print("🚗 Modern Autonomous Vehicle Traffic Simulation with Panda3D")
+    print("=" * 60)
     print("Testing: Can autonomous vehicles eliminate traffic lights?")
-    print("Technology: Advanced ML with GRPO + GNN + Communication")
-    print("=" * 50)
+    print("Technology: Advanced ML with GRPO + GNN + Communication + 3D Visualization")
+    if PANDA3D_AVAILABLE:
+        print("🎮 Panda3D 3D Graphics: AVAILABLE")
+    else:
+        print("📦 Panda3D 3D Graphics: Not installed (pip install panda3d)")
+    print("💡 Note: Trained models work for both 2D and 3D visualization")
+    print("=" * 60)
     
     
     choice = input("""
 Choose mode:
-1. Train new model (with live visualization)
-2. Train new model (text only)  
-3. Run simulation (requires trained model)
-4. Both (train then simulate)
-5. 🆚 BASELINE COMPARISON: Train with traffic lights vs no lights
-6. 🚀 ADVANCED ML: GRPO + Graph Neural Networks + Communication
-7. 🧠 CONTINUOUS ACTIONS: Advanced training with continuous control
+1. 🧠 Train AI model (with visualization - slower)
+2. ⚡ Fast train AI model (no visualization - faster)
+3. 🚗 Run 2D simulation (requires trained model)
+4. 🎮 Run 3D simulation (requires trained model)
 
-Enter choice (1-7): """).strip()
+Enter choice (1-4): """).strip()
     
     if choice == '1':
-        episodes = int(input("Training episodes (100-200 recommended): ") or "100")
+        episodes = int(input("Training episodes (50-150 recommended): ") or "100")
+        
+        # Choose visualization type for training
+        if PANDA3D_AVAILABLE:
+            viz_choice = input("Training visualization: (2)D pygame or (3)D Panda3D? [3]: ").strip() or "3"
+            use_3d = viz_choice == "3"
+        else:
+            use_3d = False
+            print("Using 2D pygame visualization (Panda3D not available)")
+        
         trainer = TrafficTrainer(use_advanced_ml=True)
-        trainer.train(episodes, use_visualization=True)
+        trainer.train(episodes, use_visualization=True, use_3d=use_3d)
         
     elif choice == '2':
-        episodes = int(input("Training episodes (100-200 recommended): ") or "100")
+        episodes = int(input("Training episodes (50-150 recommended): ") or "100")
+        
+        print("\n🧠 Fast training (no visualization)...")
         trainer = TrafficTrainer(use_advanced_ml=True)
         trainer.train(episodes, use_visualization=False)
+        print("✅ Training completed! Model saved as 'traffic_transformer_coord_advanced.pth'")
         
     elif choice == '3':
         sim = TrafficSimulation()
@@ -2737,119 +4089,19 @@ Enter choice (1-7): """).strip()
             sim.run()
             
     elif choice == '4':
-        episodes = int(input("Training episodes (100-200 recommended): ") or "100")
-        use_viz = input("Use visualization for training? (y/N): ").strip().lower() == 'y'
-        
-        print("\n🧠 Training phase...")
-        trainer = TrafficTrainer(use_advanced_ml=True)
-        trainer.train(episodes, use_visualization=use_viz)
-        
-        print("\n🚗 Simulation phase...")
-        sim = TrafficSimulation()
-        if sim.running:
-            sim.run()
-    
-    elif choice == '5':
-        episodes = int(input("Training episodes per mode (50-100 recommended): ") or "50")
-        
-        console.print(Panel.fit(
-            "🆚 [bold blue]BASELINE COMPARISON EXPERIMENT[/bold blue]\n\n"
-            f"Training {episodes} episodes with traffic lights, then {episodes} without\n"
-            f"This will generate statistical comparison data",
-            title="Baseline Comparison",
-            border_style="blue"
-        ))
-        
-        # Train with traffic lights
-        console.print("\n🚦 [red]Training WITH traffic lights (baseline)...[/red]")
-        trainer_lights = TrafficTrainer(use_advanced_ml=True)
-        trainer_lights.use_traffic_lights = True
-        lights_results = trainer_lights.train(episodes, use_visualization=False)
-        
-        # Train without traffic lights
-        console.print("\n🚗 [green]Training WITHOUT traffic lights (coordination)...[/green]")
-        trainer_coord = TrafficTrainer(use_advanced_ml=True)
-        trainer_coord.use_traffic_lights = False
-        coord_results = trainer_coord.train(episodes, use_visualization=False)
-        
-        # Compare results
-        console.print("\n📊 [bold yellow]COMPARISON RESULTS:[/bold yellow]")
-        lights_avg = np.mean(lights_results['throughput'][-10:]) if lights_results['throughput'] else 0
-        coord_avg = np.mean(coord_results['throughput'][-10:]) if coord_results['throughput'] else 0
-        
-        table = Table(title="Traffic Light vs Coordination")
-        table.add_column("Method", style="cyan")
-        table.add_column("Avg Throughput", style="magenta")
-        table.add_column("Best Episode", style="green")
-        
-        table.add_row("Traffic Lights", f"{lights_avg:.2f}", f"{max(lights_results['throughput']) if lights_results['throughput'] else 0:.2f}")
-        table.add_row("Coordination", f"{coord_avg:.2f}", f"{max(coord_results['throughput']) if coord_results['throughput'] else 0:.2f}")
-        
-        console.print(table)
-        
-        if coord_avg > lights_avg:
-            console.print("🎉 [bold green]Coordination WINS! Traffic lights can be eliminated![/bold green]")
+        if not PANDA3D_AVAILABLE:
+            print("❌ Panda3D not available! Install with: pip install panda3d")
+            print("Falling back to 2D simulation...")
+            sim = TrafficSimulation()
+            if sim.running:
+                sim.run()
         else:
-            console.print("⚠️ [bold red]Traffic lights still needed. More training required.[/bold red]")
-    
-    elif choice == '6':
-        if not ADVANCED_ML_AVAILABLE:
-            console.print("[red]Advanced ML requires torch_geometric! Install with: pip install torch_geometric[/red]")
-            return
-            
-        episodes = int(input("Advanced training episodes (50-150 recommended): ") or "100")
-        
-        console.print(Panel.fit(
-            "🚀 [bold cyan]REAL ADVANCED ML TRAINING[/bold cyan]\n\n"
-            f"• GRPO (Group Relative Policy Optimization) - NO CRITIC!\n"
-            f"• Graph Neural Networks for vehicle relationships\n"
-            f"• Learned communication protocols\n"
-            f"• Continuous action space: [accel, steer, comm]\n"
-            f"• 50% memory savings vs PPO\n\n"
-            f"This is the ACTUAL implementation that works!",
-            title="Real Advanced ML",
-            border_style="cyan"
-        ))
-        
-        # Create REAL GRPO trainer (no more stubs!)
-        trainer = TrafficTrainer(use_advanced_ml=True)
-        trainer.train(episodes, use_visualization=True)
-    
-    elif choice == '7':
-        episodes = int(input("Continuous action training episodes (50-150 recommended): ") or "100")
-        
-        console.print(Panel.fit(
-            "🧠 [bold magenta]CONTINUOUS ACTION TRAINING[/bold magenta]\n\n"
-            f"• Continuous acceleration: [-8.0, +3.0] m/s²\n"
-            f"• Continuous steering: [-1.0, +1.0] for lane changes\n"
-            f"• Communication intensity: [0.0, 1.0]\n"
-            f"• Realistic vehicle dynamics\n"
-            f"• Vehicles now use execute_action with continuous control!\n\n"
-            f"The continuous action path is ACTUALLY wired up!",
-            title="Real Continuous Actions",
-            border_style="magenta"
-        ))
-        
-        # Demo continuous actions
-        console.print("🎮 Testing continuous action execution...")
-        vehicle = AutonomousVehicle(100, 300, 0)
-        
-        # Test discrete action (legacy)
-        vehicle.execute_action(1, 0.1)
-        console.print("✅ Discrete action (legacy) works")
-        
-        # Test continuous action (new!)
-        continuous_action = torch.tensor([0.5, -0.2, 0.8])  # [accel, steer, comm]
-        vehicle.execute_action(continuous_action, 0.1)
-        console.print(f"✅ Continuous action executed: accel={0.5*8:.1f}, steer={-0.2:.1f}, comm={0.8:.1f}")
-        console.print(f"✅ Vehicle comm_intensity: {getattr(vehicle, 'comm_intensity', 'not set')}")
-        
-        # Standard training with continuous action support
-        trainer = TrafficTrainer(use_advanced_ml=True)
-        trainer.train(episodes, use_visualization=True)
+            sim = TrafficSimulation3D()
+            if sim.running:
+                sim.run_simulation()
     
     else:
-        console.print("[bold red]Invalid choice![/bold red]")
+        print("❌ Invalid choice! Please run again and choose 1, 2, 3, or 4.")
 
 if __name__ == "__main__":
     main()
