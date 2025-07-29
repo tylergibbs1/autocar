@@ -66,7 +66,7 @@ class VehicleState:
 
 class NeuralMPCController(nn.Module):
     """Predictive neural MPC controller with collision avoidance"""
-    def __init__(self, horizon: int = 25, max_vehicles: int = 20):  # Increased horizon for better prediction
+    def __init__(self, horizon: int = 15, max_vehicles: int = 20):  # Reduced from 25 for better performance
         super().__init__()
         self.horizon = horizon
         self.max_vehicles = max_vehicles
@@ -218,7 +218,7 @@ class BatchedMPCController:
         velocity_costs = torch.zeros(batch_size, device=device)
         
         # Vectorized look-ahead proximity computation (avoid in-place ops for autograd)
-        K = min(6, self.horizon + 1)
+        K = min(4, self.horizon + 1)  # Reduced from 6 for better performance
         # pos: [K,B,2] - transpose for easier indexing
         pos = trajectory_batch[:batch_size, :K, :2].permute(1, 0, 2)
         # pairwise diffs across K: [K,B,B,2]
@@ -247,18 +247,18 @@ class BatchedMPCController:
             )
             velocity_weight = torch.where(
                 near_mask,
-                torch.tensor(5.0, device=device),
-                torch.tensor(15.0, device=device)
+                torch.tensor(10.0, device=device),  # Increased from 5.0
+                torch.tensor(25.0, device=device)   # Increased from 15.0
             )
             
             # Smooth velocity profile - penalize rapid changes
             vel_errors = actual_vels - adaptive_target
             velocity_costs[i] = velocity_weight * torch.sum(vel_errors ** 2)
             
-            # Penalty for velocity changes (jerk minimization)
+            # Penalty for velocity changes (jerk minimization) - increased
             if len(actual_vels) > 1:
                 vel_changes = actual_vels[1:] - actual_vels[:-1]
-                velocity_costs[i] += 2.0 * torch.sum(vel_changes ** 2)
+                velocity_costs[i] += 5.0 * torch.sum(vel_changes ** 2)  # Increased from 2.0
         
         # Enhanced control effort cost with smoothness
         control_costs = torch.zeros(batch_size, device=device)
@@ -283,12 +283,23 @@ class BatchedMPCController:
         pos_check = trajectory_batch[:batch_size, :K_check, :2]          # [B,K,2]
         soon = ((pos_check[..., 0].abs() < center_half + 2.0) &
                 (pos_check[..., 1].abs() < center_half + 2.0)).any(dim=1).float()  # [B]
-        # penalty only if soon and not reserved
+        
+        # Check if vehicles are already inside intersection (don't penalize them)
+        already_inside = torch.tensor([
+            1.0 if (abs(v.x) < center_half + 2.0 and abs(v.y) < center_half + 2.0) else 0.0 
+            for v in vehicles[:batch_size]
+        ], device=device)
+        
+        # penalty only if soon and not reserved AND not already inside
         not_reserved = (1.0 - reserved_mask)
-        reservation_costs = 200.0 * soon * not_reserved
+        not_inside = (1.0 - already_inside)
+        reservation_costs = 200.0 * soon * not_reserved * not_inside
         
         # Advanced predictive collision avoidance cost using CPA
         collision_costs = torch.zeros(batch_size, device=device)
+        
+        # Car-following costs - vehicles should slow down when following others
+        following_costs = torch.zeros(batch_size, device=device)
 
         if batch_size > 1:
             # states at first predicted step
@@ -320,9 +331,9 @@ class BatchedMPCController:
             sep_y = torch.abs(r_star[..., 1]) - combined_half[..., 1]
             d_min = torch.maximum(sep_x, sep_y)                                            # [B,B]
 
-            margin, tau = 1.0, 2.0
+            margin, tau = 3.0, 1.0  # Increased margin significantly, reduced tau for immediate response
             gap = margin - d_min
-            dist_cost = 10000.0 * torch.relu(gap) ** 2                                     # [B,B]
+            dist_cost = 50000.0 * torch.relu(gap) ** 2  # Much higher cost penalty
             time_weight = torch.exp(-t_star / tau)                                         # [B,B]
             base_pair_cost = dist_cost * time_weight                                       # [B,B]
 
@@ -339,7 +350,64 @@ class BatchedMPCController:
             # Row-sum gives per-vehicle contribution (same behavior as your loop)
             collision_costs = (base_pair_cost * wi).sum(dim=1)                              # [B]
         
-        return velocity_costs + control_costs + reservation_costs + collision_costs
+        # Add car-following behavior - check for vehicles directly ahead in same lane
+        for i in range(batch_size):
+            vehicle = vehicles[i]
+            
+            # Find vehicle directly in front in same lane
+            front_vehicle = None
+            min_front_distance = float('inf')
+            
+            for j in range(batch_size):
+                if i == j:
+                    continue
+                other = vehicles[j]
+                
+                # Check if same lane (same approach angle)
+                if other.approach_angle != vehicle.approach_angle:
+                    continue
+                
+                # Calculate if other is in front based on approach direction
+                is_in_front = False
+                distance = 0.0
+                
+                if vehicle.approach_angle == 0:  # North (+x)
+                    if other.x > vehicle.x:
+                        distance = other.x - vehicle.x
+                        is_in_front = abs(other.y - vehicle.y) < 4.0  # Same lane check
+                elif vehicle.approach_angle == 180:  # South (-x)
+                    if other.x < vehicle.x:
+                        distance = vehicle.x - other.x
+                        is_in_front = abs(other.y - vehicle.y) < 4.0
+                elif vehicle.approach_angle == 90:  # East (+y)
+                    if other.y > vehicle.y:
+                        distance = other.y - vehicle.y
+                        is_in_front = abs(other.x - vehicle.x) < 4.0
+                elif vehicle.approach_angle == 270:  # West (-y)
+                    if other.y < vehicle.y:
+                        distance = vehicle.y - other.y
+                        is_in_front = abs(other.x - vehicle.x) < 4.0
+                
+                if is_in_front and distance < min_front_distance:
+                    min_front_distance = distance
+                    front_vehicle = other
+            
+            # Apply car-following cost if there's a vehicle in front
+            if front_vehicle is not None and min_front_distance < 40.0:  # Increased detection range
+                # Desired following distance based on speed
+                desired_distance = max(15.0, vehicle.velocity * 2.0)  # Increased from 1.5s to 2.0s following time
+                
+                if min_front_distance < desired_distance:
+                    # Cost increases as we get too close to the front vehicle
+                    distance_error = desired_distance - min_front_distance
+                    following_costs[i] = 100.0 * (distance_error ** 2)  # Doubled cost
+                    
+                    # Additional cost if we're going faster than the front vehicle
+                    speed_diff = vehicle.velocity - front_vehicle.velocity
+                    if speed_diff > 0:
+                        following_costs[i] += 60.0 * (speed_diff ** 2)  # Doubled cost
+        
+        return velocity_costs + control_costs + reservation_costs + collision_costs + following_costs
     
     def solve_batch_mpc(self, vehicles: List[VehicleState], time_step: int, reserved_ids: Optional[set] = None) -> List[float]:
         """High-performance MPC solver with CUDA streams"""
@@ -376,7 +444,7 @@ class BatchedMPCController:
             param.grad = None
         
         # More iterations for better collision avoidance planning
-        max_iterations = 15  # Increased for better collision prediction
+        max_iterations = 8  # Reduced from 15 for better performance
         best_cost = float('inf')
         best_controls = control_batch.clone()
         
@@ -425,8 +493,8 @@ class BatchedMPCController:
                         best_cost = current_cost
                         best_controls = control_batch.clone()
                 
-                # Early stopping if converged (more conservative)
-                if iteration > 5 and grad_norm < 0.005:
+                # Early stopping if converged (more aggressive for performance)
+                if iteration > 3 and grad_norm < 0.01:  # More aggressive early stopping
                     break
         
         # Use best solution found
@@ -485,6 +553,10 @@ class IntersectionSimulation:
         self.collision_alert_time = 0
         self._warn_cooldown = 0.0  # Print throttling
         
+        # Visual collision tracking (matches what user sees)
+        self.visual_collision_detected = False
+        self.visual_collision_pairs: List[Tuple[int, int]] = []
+        
         # Metrics for validation
         self.metrics = dict(unreserved_attempts=0, completed=0)
         self._inside_box_prev = {}
@@ -516,7 +588,7 @@ class IntersectionSimulation:
         
         # Performance optimization flags
         self._skip_frames = 0
-        self._frame_skip_count = 2  # Skip every N frames for smoother animation
+        self._frame_skip_count = 1  # Reduced from 2 - update every frame but with optimized rendering
     
     def add_vehicle(self, vehicle: VehicleState):
         """Add vehicle with proper lane positioning"""
@@ -603,6 +675,93 @@ class IntersectionSimulation:
         return (np.array([v.length*0.5, v.width*0.5]) if v.approach_angle in (0, 180)
                 else np.array([v.width*0.5, v.length*0.5]))
 
+    def find_vehicle_in_front(self, ego_vehicle: VehicleState, max_distance: float = 50.0) -> Optional[VehicleState]:
+        """Find the closest vehicle directly in front in the same lane"""
+        closest_vehicle = None
+        closest_distance = float('inf')
+        
+        for other in self.vehicles:
+            if other.id == ego_vehicle.id:
+                continue
+            
+            # Check if vehicles are in the same lane (same approach angle)
+            if other.approach_angle != ego_vehicle.approach_angle:
+                continue
+            
+            # Calculate if the other vehicle is in front
+            if ego_vehicle.approach_angle == 0:  # North - moving in +x direction
+                if other.x > ego_vehicle.x:  # Other is ahead
+                    distance = other.x - ego_vehicle.x
+                    # Check if in same lane (similar y coordinate)
+                    if abs(other.y - ego_vehicle.y) < self.lane_width / 2 and distance < max_distance:
+                        if distance < closest_distance:
+                            closest_distance = distance
+                            closest_vehicle = other
+                            
+            elif ego_vehicle.approach_angle == 180:  # South - moving in -x direction
+                if other.x < ego_vehicle.x:  # Other is ahead
+                    distance = ego_vehicle.x - other.x
+                    if abs(other.y - ego_vehicle.y) < self.lane_width / 2 and distance < max_distance:
+                        if distance < closest_distance:
+                            closest_distance = distance
+                            closest_vehicle = other
+                            
+            elif ego_vehicle.approach_angle == 90:  # East - moving in +y direction
+                if other.y > ego_vehicle.y:  # Other is ahead
+                    distance = other.y - ego_vehicle.y
+                    if abs(other.x - ego_vehicle.x) < self.lane_width / 2 and distance < max_distance:
+                        if distance < closest_distance:
+                            closest_distance = distance
+                            closest_vehicle = other
+                            
+            elif ego_vehicle.approach_angle == 270:  # West - moving in -y direction
+                if other.y < ego_vehicle.y:  # Other is ahead
+                    distance = ego_vehicle.y - other.y
+                    if abs(other.x - ego_vehicle.x) < self.lane_width / 2 and distance < max_distance:
+                        if distance < closest_distance:
+                            closest_distance = distance
+                            closest_vehicle = other
+        
+        return closest_vehicle
+
+    def check_visual_collisions_realtime(self):
+        """Real-time collision detection matching visual representation"""
+        if len(self.vehicles) < 2:
+            return False, []
+        
+        visual_collisions = []
+        
+        for i in range(len(self.vehicles)):
+            for j in range(i + 1, len(self.vehicles)):
+                vi, vj = self.vehicles[i], self.vehicles[j]
+                
+                # Use same dimensions as visual shapes
+                # Get current half-extents (not predictive)
+                ext_i = self.half_extents_world_np(vi)
+                ext_j = self.half_extents_world_np(vj)
+                
+                # Current positions (not predictive)
+                pos_i = np.array([vi.x, vi.y])
+                pos_j = np.array([vj.x, vj.y])
+                
+                # Calculate separation
+                delta = pos_i - pos_j
+                combined_extents = ext_i + ext_j
+                
+                # L∞ (rectangular) collision check for current time
+                sep_x = abs(delta[0]) - combined_extents[0]
+                sep_y = abs(delta[1]) - combined_extents[1]
+                
+                # Collision if both separations are negative (overlapping)
+                if sep_x <= 0.0 and sep_y <= 0.0:
+                    visual_collisions.append((vi.id, vj.id))
+                # Reduced tolerance - only flag if really close visually
+                elif sep_x <= 0.2 and sep_y <= 0.2:
+                    # Very close - might appear as collision visually
+                    visual_collisions.append((vi.id, vj.id))
+        
+        return len(visual_collisions) > 0, visual_collisions
+
     def check_collisions_continuous(self):
         """Proper CPA-based collision detection with orientation-aware extents"""
         if len(self.vehicles) < 2:
@@ -630,11 +789,11 @@ class IntersectionSimulation:
                     self.collision_alert_time = self.current_step  # Update collision counter
                     if self._warn_cooldown <= 0.0:
                         print(f"PREDICTED COLLISION! V{vi.id}–V{vj.id} in ~{t_cpa:.2f}s (d_min={d_min:.2f}m)")
-                        self._warn_cooldown = 0.5  # seconds
-                elif d_min < 2.0 and t_cpa < 3.0:  # Close call warning
+                        self._warn_cooldown = 2.0  # Increased cooldown to reduce spam
+                elif d_min < 1.5 and t_cpa < 2.0:  # Reduced sensitivity for close calls
                     if self._warn_cooldown <= 0.0:
                         print(f"CLOSE CALL! V{vi.id}–V{vj.id} will be {d_min:.1f}m apart in {t_cpa:.2f}s")
-                        self._warn_cooldown = 0.5  # seconds
+                        self._warn_cooldown = 1.5  # Longer cooldown for close calls
     
     def arrival_window(self, distance, v, a_max, a_min):
         """Earliest/latest arrival using accel bounds. a_min ≤ 0."""
@@ -727,13 +886,46 @@ class IntersectionSimulation:
             vv = vehicle.velocity if vehicle.approach_angle == 90 else (-vehicle.velocity if vehicle.approach_angle == 270 else 0.0)
         return p, vv
 
-    def cbf_clip(self, u_nom, i, vehicles, dt, d_safe=6.0, alpha=0.2):
+    def cbf_clip(self, u_nom, i, vehicles, dt, d_safe=12.0, alpha=0.5):  # Much larger safety distance and alpha
         """Proper discrete-time CBF safety filter with numerical safeguards and cross-traffic guard"""
         veh = vehicles[i]
         u_min, u_max = -veh.max_decel, veh.max_accel
 
+        # Check if vehicle is in intersection - be less restrictive
+        in_intersection = self._inside_box(veh.x, veh.y)
+        if in_intersection:
+            # Relax constraints for vehicles already in intersection
+            d_safe = max(6.0, d_safe * 0.6)  # Still maintain reasonable safety in intersection
+            alpha = max(0.2, alpha * 0.5)   # Less conservative in intersection
+            u_min = max(u_min, -2.0)        # Limit hard braking in intersection
+
         # Cross-traffic guard: check if any vehicle will reach intersection center within 1.0s
         intersection_eta_i = self._time_to_intersection_center(veh)
+        
+        # Car-following check: find vehicle directly in front
+        front_vehicle = self.find_vehicle_in_front(veh, max_distance=40.0)
+        if front_vehicle is not None:
+            # Calculate distance to front vehicle
+            if veh.approach_angle == 0:  # North
+                front_distance = front_vehicle.x - veh.x
+            elif veh.approach_angle == 180:  # South
+                front_distance = veh.x - front_vehicle.x
+            elif veh.approach_angle == 90:  # East
+                front_distance = front_vehicle.y - veh.y
+            else:  # West
+                front_distance = veh.y - front_vehicle.y
+            
+            # Apply stronger car-following constraints (but not in intersection)
+            if front_distance < 25.0 and not in_intersection:  # Increased from 20.0
+                # More conservative parameters for car-following
+                d_safe = max(d_safe, front_distance * 0.9)  # Increased from 0.8
+                alpha = min(0.9, alpha * 2.5)  # More conservative
+                
+                # Limit acceleration if getting too close
+                if front_distance < 20.0:  # Increased from 15.0
+                    u_max = min(u_max, -1.0)  # Stronger deceleration
+                elif front_distance < 25.0 and veh.velocity > front_vehicle.velocity:
+                    u_max = min(u_max, -0.5)  # Force deceleration if faster
         
         for j, oth in enumerate(vehicles):
             if j == i:
@@ -743,9 +935,10 @@ class IntersectionSimulation:
             intersection_eta_j = self._time_to_intersection_center(oth)
             if (abs(intersection_eta_i - intersection_eta_j) < 1.0 and 
                 intersection_eta_i < 5.0 and intersection_eta_j < 5.0):
-                # Perpendicular conflict detected - increase safety margin
-                alpha = min(0.5, alpha * 2.0)  # More conservative CBF
-                u_max = min(u_max, 0.5)        # also cap aggressive acceleration
+                # Perpendicular conflict detected - but less restrictive if in intersection
+                if not in_intersection:
+                    alpha = min(0.6, alpha * 2.0)  # More conservative CBF
+                    u_max = min(u_max, 0.3)        # Cap aggressive acceleration even more
             
             p_i, v_i = self._axis_proj(veh, veh.approach_angle)
             p_j, v_j = self._axis_proj(oth, veh.approach_angle)  # project other onto ego axis
@@ -850,9 +1043,30 @@ class IntersectionSimulation:
         for i, vehicle in enumerate(self.vehicles):
             accel = safe_accels[i]
             
+            # Check if vehicle is in intersection
+            inside_intersection = self._inside_box(vehicle.x, vehicle.y)
+            
+            # Prevent complete stops in intersection
+            if inside_intersection:
+                # Force minimum speed in intersection to prevent deadlock
+                min_intersection_speed = 3.0  # m/s minimum speed in intersection
+                if vehicle.velocity < min_intersection_speed:
+                    # Override with gentle acceleration to maintain flow
+                    accel = max(accel, 1.0)  # Minimum 1.0 m/s² acceleration in intersection
+                    print(f"V{vehicle.id}: Preventing intersection stop - forcing acceleration {accel:.2f}")
+            
             # Update velocity
             vehicle.velocity += accel * self.dt
-            vehicle.velocity = np.clip(vehicle.velocity, 0, vehicle.target_velocity * 1.5)  # Increased from 1.2
+            
+            # Special handling for intersection vehicles
+            if inside_intersection:
+                # Ensure minimum speed in intersection
+                vehicle.velocity = max(vehicle.velocity, 2.0)  # Never go below 2 m/s in intersection
+                # Cap maximum speed to prevent dangerous speeds
+                vehicle.velocity = min(vehicle.velocity, vehicle.target_velocity * 1.2)
+            else:
+                # Normal speed limits outside intersection
+                vehicle.velocity = np.clip(vehicle.velocity, 0, vehicle.target_velocity * 1.5)
             
             # Sanity check for negative speeds
             assert vehicle.velocity >= -1e-9, f"Negative velocity {vehicle.velocity} for vehicle {vehicle.id}"
@@ -877,8 +1091,17 @@ class IntersectionSimulation:
         # Update intersection reservations
         self.update_intersection_schedule()
         
-        # Check collisions with continuous detection
-        self.check_collisions_continuous()
+        # Check collisions less frequently for performance
+        if self.current_step % 3 == 0:  # Every 3rd step
+            self.check_collisions_continuous()
+        
+        # Always check visual collisions for accurate display
+        visual_collision_detected, visual_collision_pairs = self.check_visual_collisions_realtime()
+        
+        # Store both types for metrics
+        self.visual_collision_detected = visual_collision_detected
+        self.visual_collision_pairs = visual_collision_pairs
+        
         self.current_step += 1
     
     def create_car_shape(self, x: float, y: float, angle: int, length: float = 4.5, width: float = 2.0) -> np.ndarray:
@@ -996,11 +1219,11 @@ class IntersectionSimulation:
                                                     edgecolor='#00ff88', linewidth=2, alpha=0.95))
     
     def animate(self, frame):
-        """Optimized animation update with frame skipping"""
+        """Highly optimized animation update with aggressive performance tuning"""
         if not self.plot_initialized:
             return []
         
-        # Frame skipping for performance
+        # More aggressive frame skipping for smoother UI
         self._skip_frames += 1
         if self._skip_frames < self._frame_skip_count:
             return []
@@ -1013,86 +1236,146 @@ class IntersectionSimulation:
             # Run simulation step
             self.simulate_step()
             
-            # Update visualizations
+            # Batch update all visualizations efficiently
+            updated_artists = []
+            
+            # Pre-calculate common values once
+            current_time = frame * self.dt
+            
             for vehicle in self.vehicles:
-                if vehicle.id in self.vehicle_shapes:
-                    # Update car shape
-                    car_points = self.create_car_shape(vehicle.x, vehicle.y, vehicle.approach_angle)
-                    self.vehicle_shapes[vehicle.id].set_xy(car_points)
+                if vehicle.id not in self.vehicle_shapes:
+                    continue
                     
-                    # Update trail
-                    if len(self.history_x[vehicle.id]) > 1:
-                        self.vehicle_trails[vehicle.id].set_data(
-                            self.history_x[vehicle.id][-50:],
-                            self.history_y[vehicle.id][-50:]
-                        )
-                    
-                    # Update speed plot
-                    times = [i * self.dt for i in range(len(self.history_v[vehicle.id]))]
-                    self.speed_lines[vehicle.id].set_data(times, self.history_v[vehicle.id])
-                    
-                    # Auto-extend speed plot x-axis for long simulations
-                    if times and times[-1] > self.ax_speed.get_xlim()[1]:
-                        self.ax_speed.set_xlim(0, times[-1] + 5)
-                    
-                    # Update predicted path - optimized GPU trajectory handling
+                # Update car shape (most expensive operation)
+                car_points = self.create_car_shape(vehicle.x, vehicle.y, vehicle.approach_angle)
+                self.vehicle_shapes[vehicle.id].set_xy(car_points)
+                updated_artists.append(self.vehicle_shapes[vehicle.id])
+                
+                # Update trail with reduced history for performance
+                hist_len = len(self.history_x[vehicle.id])
+                if hist_len > 1:
+                    # Use fewer trail points for better performance
+                    trail_points = min(25, hist_len)  # Reduced from 50
+                    self.vehicle_trails[vehicle.id].set_data(
+                        self.history_x[vehicle.id][-trail_points:],
+                        self.history_y[vehicle.id][-trail_points:]
+                    )
+                    updated_artists.append(self.vehicle_trails[vehicle.id])
+                
+                # Update speed plot more frequently for better responsiveness
+                if frame % 2 == 0:  # Update every 2nd frame instead of 3rd
+                    times = [i * self.dt for i in range(hist_len)]
+                    if times and self.history_v[vehicle.id]:  # Ensure data exists
+                        self.speed_lines[vehicle.id].set_data(times, self.history_v[vehicle.id])
+                        # Ensure speed plot stays visible
+                        if vehicle.id not in getattr(self, '_speed_plot_updated', set()):
+                            self.speed_lines[vehicle.id].set_visible(True)
+                            if not hasattr(self, '_speed_plot_updated'):
+                                self._speed_plot_updated = set()
+                            self._speed_plot_updated.add(vehicle.id)
+                
+                # Update predicted path with minimal GPU transfers
+                if frame % 5 == 0:  # Update every 5th frame for prediction
                     if hasattr(vehicle, '_gpu_trajectory') and vehicle._gpu_trajectory is not None:
-                        # Only transfer small subset to CPU for visualization
                         with torch.no_grad():
-                            pred_subset = vehicle._gpu_trajectory[:10].cpu().numpy()  # Reduced from 20 to 10
-                            pred_x = pred_subset[:, 0]
-                            pred_y = pred_subset[:, 1]
-                            self.predicted_paths[vehicle.id].set_data(pred_x, pred_y)
+                            # Even fewer prediction points for performance
+                            pred_subset = vehicle._gpu_trajectory[:6].cpu().numpy()  # Reduced from 10
+                            self.predicted_paths[vehicle.id].set_data(pred_subset[:, 0], pred_subset[:, 1])
                     elif hasattr(vehicle, 'planned_trajectory') and vehicle.planned_trajectory is not None:
-                        pred_x = vehicle.planned_trajectory[:10, 0]  # Reduced points
-                        pred_y = vehicle.planned_trajectory[:10, 1]
+                        pred_x = vehicle.planned_trajectory[:6, 0]  # Reduced points
+                        pred_y = vehicle.planned_trajectory[:6, 1]
                         self.predicted_paths[vehicle.id].set_data(pred_x, pred_y)
             
-            # Update metrics
-            current_speeds = [v.velocity for v in self.vehicles]
-            if current_speeds:
-                min_speed = min(current_speeds)
-                max_speed = max(current_speeds)
-                avg_speed = np.mean(current_speeds)
+            # Update metrics less frequently
+            if frame % 5 == 0:  # Update every 5th frame
+                self._update_metrics_display(frame)
+            
+            # Auto-extend speed plot x-axis more frequently
+            if frame % 5 == 0 and self.vehicles:  # Every 5th frame
+                max_time = max(len(self.history_v[v.id]) * self.dt for v in self.vehicles if self.history_v[v.id])
+                if max_time > self.ax_speed.get_xlim()[1]:
+                    self.ax_speed.set_xlim(0, max_time + 5)
                 
-                # Minimum distance
-                if len(self.vehicles) > 1:
-                    positions = np.array([[v.x, v.y] for v in self.vehicles])
-                    pos_diff = positions[:, np.newaxis, :] - positions[np.newaxis, :, :]
-                    distances = np.linalg.norm(pos_diff, axis=2)
-                    distances[distances == 0] = np.inf
-                    min_distance = np.min(distances)
-                else:
-                    min_distance = float('inf')
+                # Also update y-axis to fit all speeds
+                all_speeds = []
+                for v in self.vehicles:
+                    if self.history_v[v.id]:
+                        all_speeds.extend(self.history_v[v.id])
                 
-                # Vehicles in intersection
-                in_intersection = sum(1 for v in self.vehicles
-                                    if abs(v.x) < self.intersection_size/2 + 5 and
-                                       abs(v.y) < self.intersection_size/2 + 5)
+                if all_speeds:
+                    max_speed = max(all_speeds)
+                    if max_speed > self.ax_speed.get_ylim()[1]:
+                        self.ax_speed.set_ylim(0, max_speed + 2)
                 
-                time_elapsed = frame * self.dt
-                efficiency = (avg_speed / np.mean([v.target_velocity for v in self.vehicles])) * 100
-                
-                metrics_str = f"TIME: {time_elapsed:.1f}s\n"
-                metrics_str += f"VEHICLES: {len(self.vehicles)} active\n"
-                metrics_str += f"IN INTERSECTION: {in_intersection}\n"
-                metrics_str += f"MIN DISTANCE: {min_distance:.1f}m\n"
-                metrics_str += f"SPEEDS: {min_speed:.1f} - {max_speed:.1f} m/s\n"
-                metrics_str += f"AVG SPEED: {avg_speed:.1f} m/s\n"
-                metrics_str += f"EFFICIENCY: {efficiency:.0f}%\n"
-                metrics_str += f"UNRESERVED ATTEMPTS: {self.metrics['unreserved_attempts']}\n"
-                metrics_str += f"COMPLETED: {self.metrics['completed']}\n"
-                
-                if self.collision_detected:
-                    collision_pairs_str = ", ".join([f"V{p[0]}-V{p[1]}" for p in self.collision_pairs])
-                    metrics_str += f"COLLISION: {collision_pairs_str}\n"
-                    metrics_str += f"SAFETY: COLLISION DETECTED!"
-                else:
-                    metrics_str += f"SAFETY: {'SAFE' if min_distance > 8.0 else 'CLOSE' if min_distance > 5.0 else 'DANGER'}"
-                
-                self.metrics_text.set_text(metrics_str)
+                # Force redraw of speed plot
+                self.ax_speed.relim()
+                self.ax_speed.autoscale_view(scalex=True, scaley=True)
         
-        return list(self.vehicle_shapes.values()) + list(self.vehicle_trails.values())
+        # Return all artists that need updating
+        return (list(self.vehicle_shapes.values()) + 
+                list(self.vehicle_trails.values()) + 
+                list(self.speed_lines.values()) +
+                list(self.predicted_paths.values()))
+    
+    def _update_metrics_display(self, frame):
+        """Separated metrics update for performance"""
+        current_speeds = [v.velocity for v in self.vehicles]
+        if not current_speeds:
+            return
+            
+        min_speed = min(current_speeds)
+        max_speed = max(current_speeds)
+        avg_speed = np.mean(current_speeds)
+        
+        # Minimum distance calculation (expensive, do less frequently)
+        if len(self.vehicles) > 1:
+            positions = np.array([[v.x, v.y] for v in self.vehicles])
+            pos_diff = positions[:, np.newaxis, :] - positions[np.newaxis, :, :]
+            distances = np.linalg.norm(pos_diff, axis=2)
+            distances[distances == 0] = np.inf
+            min_distance = np.min(distances)
+        else:
+            min_distance = float('inf')
+        
+        # Count vehicles in car-following mode
+        following_count = 0
+        for vehicle in self.vehicles:
+            front_vehicle = self.find_vehicle_in_front(vehicle, max_distance=30.0)
+            if front_vehicle is not None:
+                following_count += 1
+        
+        # Vehicles in intersection
+        in_intersection = sum(1 for v in self.vehicles
+                            if abs(v.x) < self.intersection_size/2 + 5 and
+                               abs(v.y) < self.intersection_size/2 + 5)
+        
+        time_elapsed = frame * self.dt
+        efficiency = (avg_speed / np.mean([v.target_velocity for v in self.vehicles])) * 100
+        
+        metrics_str = f"TIME: {time_elapsed:.1f}s | VEHICLES: {len(self.vehicles)}\n"
+        metrics_str += f"IN INTERSECTION: {in_intersection} | MIN DIST: {min_distance:.1f}m\n"
+        metrics_str += f"FOLLOWING: {following_count} | SPEEDS: {avg_speed:.1f} m/s ({efficiency:.0f}%)\n"
+        metrics_str += f"UNRESERVED: {self.metrics['unreserved_attempts']} | COMPLETED: {self.metrics['completed']}\n"
+        
+        # Show both collision types
+        if self.visual_collision_detected:
+            visual_pairs_str = ", ".join([f"V{p[0]}-V{p[1]}" for p in self.visual_collision_pairs])
+            metrics_str += f"🔴 VISUAL COLLISION: {visual_pairs_str}\n"
+        
+        if self.collision_detected:
+            pred_pairs_str = ", ".join([f"V{p[0]}-V{p[1]}" for p in self.collision_pairs])
+            metrics_str += f"⚠️ PREDICTED COLLISION: {pred_pairs_str}\n"
+        
+        # Overall safety status
+        if self.visual_collision_detected:
+            metrics_str += f"SAFETY: ACTUAL COLLISION!"
+        elif self.collision_detected:
+            metrics_str += f"SAFETY: COLLISION PREDICTED"
+        else:
+            safety_status = 'SAFE' if min_distance > 8.0 else 'CLOSE' if min_distance > 5.0 else 'DANGER'
+            metrics_str += f"SAFETY: {safety_status}"
+        
+        self.metrics_text.set_text(metrics_str)
     
     def finalize_setup(self):
         if not self.plot_initialized:
@@ -1101,9 +1384,9 @@ class IntersectionSimulation:
     
     def run_animation(self):
         self.finalize_setup()
-        # Optimized animation settings for high performance
+        # Disable blitting to fix speed plot updates
         ani = animation.FuncAnimation(self.fig, self.animate, frames=1000,
-                                    interval=50, blit=False, repeat=False,  # Adjusted for stability
+                                    interval=33, blit=False, repeat=False,  # Disabled blitting for subplot compatibility
                                     cache_frame_data=False)  # Reduce memory usage
         plt.tight_layout()
         plt.show(block=True)  # Block to keep window open
