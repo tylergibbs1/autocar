@@ -8,13 +8,14 @@ import numpy as np
 
 # Disable automatic compilation that requires C++ compiler
 torch._dynamo.config.suppress_errors = True
-torch.backends.cudnn.enabled = False
+torch.backends.cudnn.enabled = True  # Enable cuDNN for better GPU performance
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from matplotlib.patches import Rectangle, Polygon
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 from collections import deque
+import heapq
 
 # Reproducibility seeds
 torch.manual_seed(0)
@@ -127,13 +128,57 @@ class NeuralMPCController(nn.Module):
                     nn.init.zeros_(module.bias)
 
 
+class TrainingDataCollector:
+    """Collects training examples from successful MPC solutions"""
+    def __init__(self, max_samples: int = 25000):
+        self.max_samples = max_samples
+        self.states = []
+        self.controls = []
+        self.costs = []
+        self.sample_count = 0
+        
+    def add_sample(self, state: torch.Tensor, optimal_control: torch.Tensor, cost: float):
+        """Add a training sample"""
+        if self.sample_count < self.max_samples:
+            self.states.append(state.cpu().clone())
+            self.controls.append(optimal_control.cpu().clone())
+            self.costs.append(cost)
+            self.sample_count += 1
+        else:
+            # Replace random sample to maintain diversity
+            idx = np.random.randint(0, self.max_samples)
+            self.states[idx] = state.cpu().clone()
+            self.controls[idx] = optimal_control.cpu().clone()
+            self.costs[idx] = cost
+    
+    def get_dataset(self, device):
+        """Get training dataset as tensors"""
+        if len(self.states) == 0:
+            return None, None
+        
+        states_tensor = torch.stack(self.states).to(device)
+        controls_tensor = torch.stack(self.controls).to(device)
+        return states_tensor, controls_tensor
+    
+    def clear(self):
+        """Clear collected data"""
+        self.states.clear()
+        self.controls.clear()
+        self.costs.clear()
+        self.sample_count = 0
+
+
 class BatchedMPCController:
-    """High-performance batched MPC controller"""
-    def __init__(self, neural_mpc: NeuralMPCController, dt: float = 0.1):
+    """High-performance batched MPC controller with training data collection"""
+    def __init__(self, neural_mpc: NeuralMPCController, dt: float = 0.1, collect_training_data: bool = False):
         self.neural_mpc = neural_mpc
         self.dt = dt
         self.horizon = neural_mpc.horizon
         self.max_vehicles = neural_mpc.max_vehicles
+        self.collect_training_data = collect_training_data
+        
+        # Training data collector
+        self.data_collector = TrainingDataCollector() if collect_training_data else None
         
         # Pre-allocated GPU tensors with optimal memory management
         self.state_batch = torch.zeros((self.max_vehicles, neural_mpc.control_network[0].in_features), 
@@ -190,16 +235,33 @@ class BatchedMPCController:
             self.state_batch[:batch_size].copy_(state_gpu)
         return self.state_batch[:batch_size]
     
-    def predict_trajectories_batch(self, control_batch: torch.Tensor, vehicles: List[VehicleState]) -> torch.Tensor:
-        """Vectorized trajectory prediction with cumsums"""
+    def predict_trajectories_batch(self, control_batch: torch.Tensor, vehicles: List[VehicleState], 
+                                  sim_preallocated_tensors=None) -> torch.Tensor:
+        """Vectorized trajectory prediction with cumsums - optimized with pre-allocated tensors"""
         B = control_batch.shape[0]
-        # initial state
-        xyv0 = torch.tensor([[v.x, v.y, v.velocity] for v in vehicles[:B]],
-                            device=device, dtype=torch.float32)                         # [B,3]
-        dirs = torch.tensor([DIR_MAP[v.approach_angle] for v in vehicles[:B]],
-                            device=device, dtype=torch.float32)                         # [B,2]
-        target = torch.tensor([v.target_velocity*1.2 for v in vehicles[:B]],
-                              device=device, dtype=torch.float32)                       # [B]
+        
+        if sim_preallocated_tensors is not None:
+            # Use pre-allocated tensors from simulation
+            xyv0 = sim_preallocated_tensors['xyv0'][:B]
+            dirs = sim_preallocated_tensors['directions'][:B]
+            target = sim_preallocated_tensors['target_velocities'][:B]
+            
+            # Fill pre-allocated tensors directly
+            for i, v in enumerate(vehicles[:B]):
+                xyv0[i, 0] = v.x
+                xyv0[i, 1] = v.y  
+                xyv0[i, 2] = v.velocity
+                dirs[i, 0] = DIR_MAP[v.approach_angle][0]
+                dirs[i, 1] = DIR_MAP[v.approach_angle][1]
+                target[i] = v.target_velocity * 1.2
+        else:
+            # Fallback to old method
+            xyv0 = torch.tensor([[v.x, v.y, v.velocity] for v in vehicles[:B]],
+                                device=device, dtype=torch.float32)                         # [B,3]
+            dirs = torch.tensor([DIR_MAP[v.approach_angle] for v in vehicles[:B]],
+                                device=device, dtype=torch.float32)                         # [B,2]
+            target = torch.tensor([v.target_velocity*1.2 for v in vehicles[:B]],
+                                  device=device, dtype=torch.float32)                       # [B]
 
         # accelerations per step
         acc = control_batch.clamp(-1.0, 1.0) * 3.0                                     # [B,H]
@@ -422,7 +484,7 @@ class BatchedMPCController:
         
         return following_costs
     
-    def solve_batch_mpc(self, vehicles: List[VehicleState], time_step: int, reserved_ids: Optional[set] = None, cached_dirs=None, cached_half_exts=None, cached_priorities=None) -> List[float]:
+    def solve_batch_mpc(self, vehicles: List[VehicleState], time_step: int, reserved_ids: Optional[set] = None, cached_dirs=None, cached_half_exts=None, cached_priorities=None, preallocated_tensors=None) -> List[float]:
         """High-performance MPC solver with CUDA streams"""
         if not vehicles:
             return []
@@ -433,6 +495,7 @@ class BatchedMPCController:
         self._dirs = cached_dirs
         self._half_exts = cached_half_exts
         self._priorities = cached_priorities
+        self._preallocated_tensors = preallocated_tensors
         
         # Debug assertions to catch shape mismatches
         assert batch_size <= self.max_vehicles, f"Batch size {batch_size} exceeds max {self.max_vehicles}"
@@ -468,7 +531,7 @@ class BatchedMPCController:
             control_var = control_batch.clone().requires_grad_(True)
             
             # Forward pass
-            trajectory_batch = self.predict_trajectories_batch(control_var, vehicles)
+            trajectory_batch = self.predict_trajectories_batch(control_var, vehicles, self._preallocated_tensors)
             
             # Shape assertions during optimization
             assert trajectory_batch.shape[:2] == (batch_size, self.horizon + 1), f"Trajectory shape {trajectory_batch.shape[:2]} != ({batch_size}, {self.horizon + 1})"
@@ -512,9 +575,27 @@ class BatchedMPCController:
         # Use best solution found
         control_batch = best_controls
         
+        # Collect training data if enabled
+        if self.collect_training_data and self.data_collector is not None:
+            final_cost = best_total.item()
+            # Collect all samples for training (removed threshold - we'll filter during training)
+            for i in range(batch_size):
+                self.data_collector.add_sample(
+                    state_batch[i], 
+                    control_batch[i], 
+                    final_cost / batch_size  # Per-vehicle cost
+                )
+            # Debug: Print collection stats occasionally
+            if hasattr(self, '_debug_counter'):
+                self._debug_counter += 1
+            else:
+                self._debug_counter = 1
+            if self._debug_counter % 50 == 0:
+                print(f"Training data: {self.data_collector.sample_count} samples, last cost: {final_cost:.1f}")
+        
         # Update planned trajectories (final forward pass) - no gradients needed
         with torch.inference_mode():
-            final_trajectories = self.predict_trajectories_batch(control_batch, vehicles)
+            final_trajectories = self.predict_trajectories_batch(control_batch, vehicles, self._preallocated_tensors)
             # Always store as CPU numpy arrays to avoid GPU memory management issues
             for i, vehicle in enumerate(vehicles):
                 # Properly transfer to CPU with synchronization
@@ -533,9 +614,111 @@ class BatchedMPCController:
             return first_controls.cpu().tolist()
 
 
+class NeuralMPCTrainer:
+    """Trainer for the neural MPC controller"""
+    def __init__(self, neural_mpc: NeuralMPCController, learning_rate: float = 1e-3):
+        self.neural_mpc = neural_mpc
+        self.optimizer = torch.optim.Adam(neural_mpc.parameters(), lr=learning_rate)
+        self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=100, gamma=0.9)
+        
+    def train_epoch(self, states: torch.Tensor, targets: torch.Tensor, batch_size: int = 64) -> float:
+        """Train for one epoch on the collected data"""
+        dataset_size = states.shape[0]
+        total_loss = 0.0
+        num_batches = 0
+        
+        # Filter out the worst samples (top 20% by cost) for better training
+        if hasattr(self, '_sample_costs') and len(self._sample_costs) == dataset_size:
+            costs = torch.tensor(self._sample_costs, device=states.device)
+            cost_threshold = torch.quantile(costs, 0.8)  # Keep bottom 80% by cost
+            good_indices = costs <= cost_threshold
+            states = states[good_indices]
+            targets = targets[good_indices]
+            dataset_size = states.shape[0]
+            print(f"Filtered to {dataset_size} good samples (cost <= {cost_threshold.item():.1f})")
+        
+        # Shuffle data
+        indices = torch.randperm(dataset_size, device=states.device)
+        states = states[indices]
+        targets = targets[indices]
+        
+        self.neural_mpc.train()
+        
+        for i in range(0, dataset_size, batch_size):
+            end_idx = min(i + batch_size, dataset_size)
+            batch_states = states[i:end_idx]
+            batch_targets = targets[i:end_idx]
+            
+            # Forward pass
+            predictions = self.neural_mpc(batch_states)
+            
+            # MSE loss between predicted and optimal controls
+            loss = torch.nn.functional.mse_loss(predictions, batch_targets)
+            
+            # Backward pass
+            self.optimizer.zero_grad()
+            loss.backward()
+            
+            # Gradient clipping for stability
+            torch.nn.utils.clip_grad_norm_(self.neural_mpc.parameters(), max_norm=1.0)
+            
+            self.optimizer.step()
+            
+            total_loss += loss.item()
+            num_batches += 1
+        
+        self.scheduler.step()
+        avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+        
+        self.neural_mpc.eval()  # Back to eval mode
+        return avg_loss
+    
+    def train_from_data_collector(self, data_collector: TrainingDataCollector, epochs: int = 50, batch_size: int = 64) -> List[float]:
+        """Train the neural network using collected data"""
+        states, targets = data_collector.get_dataset(device)
+        
+        if states is None or states.shape[0] < batch_size:
+            print(f"Not enough training data: {states.shape[0] if states is not None else 0} samples")
+            return []
+        
+        # Store costs for filtering
+        self._sample_costs = data_collector.costs
+        
+        print(f"Training on {states.shape[0]} samples for {epochs} epochs")
+        print(f"Cost range: {min(data_collector.costs):.1f} to {max(data_collector.costs):.1f}")
+        
+        losses = []
+        for epoch in range(epochs):
+            avg_loss = self.train_epoch(states, targets, batch_size)
+            losses.append(avg_loss)
+            
+            if epoch % 10 == 0:
+                print(f"Epoch {epoch:3d}, Loss: {avg_loss:.6f}, LR: {self.scheduler.get_last_lr()[0]:.6f}")
+        
+        print(f"Training completed. Final loss: {losses[-1]:.6f}")
+        return losses
+    
+    def save_model(self, filepath: str):
+        """Save the trained model"""
+        torch.save({
+            'model_state_dict': self.neural_mpc.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+        }, filepath)
+        print(f"Model saved to {filepath}")
+    
+    def load_model(self, filepath: str):
+        """Load a trained model"""
+        checkpoint = torch.load(filepath, map_location=device)
+        self.neural_mpc.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        print(f"Model loaded from {filepath}")
+
+
 class IntersectionSimulation:
     """Main simulation class with optimal data structures"""
-    def __init__(self, intersection_size: int = 20, dt: float = 0.1, max_vehicles: int = 20):
+    def __init__(self, intersection_size: int = 20, dt: float = 0.1, max_vehicles: int = 20, training_mode: bool = False):
         self.intersection_size = intersection_size
         self.lane_width = 8.0
         self.dt = dt
@@ -553,15 +736,15 @@ class IntersectionSimulation:
         neural_mpc = neural_mpc.to(device=device, dtype=torch.float32)
         neural_mpc.eval()  # inference-only
         
-        # Try to compile the neural network for extra speed
-        try:
-            if hasattr(torch, 'compile'):
-                neural_mpc = torch.compile(neural_mpc, fullgraph=False)
-        except Exception as e:
-            print(f"Note: torch.compile failed ({e}), continuing without compilation")
-            pass  # compilation failed -> ignore
+        # Disable torch compilation to avoid C++ compiler issues
+        # torch.compile requires MSVC which isn't available
+        # neural_mpc already optimized with standard PyTorch
             
-        self.controller = BatchedMPCController(neural_mpc, dt=dt)
+        self.controller = BatchedMPCController(neural_mpc, dt=dt, collect_training_data=training_mode)
+        
+        # Training components
+        self.training_mode = training_mode
+        self.trainer = NeuralMPCTrainer(neural_mpc) if training_mode else None
         
         # Propagate scene parameters to controller
         self.controller.center_half = self.center_half
@@ -592,10 +775,11 @@ class IntersectionSimulation:
         self._inside_box_prev = {}
         self._has_completed = {}
         
-        # Intersection scheduling
+        # Intersection scheduling - optimized with heap for O(log n) operations
         self.conflict_zones = {
             'center': {'bounds': (-intersection_size/2, intersection_size/2, -intersection_size/2, intersection_size/2),
-                      'reservations': []},  # [(vehicle_id, start_time, end_time)]
+                      'reservations_heap': [],  # min-heap of (end_time, vehicle_id, start_time)
+                      'active_reservations': set()},  # set of currently active vehicle_ids
         }
         self.headway_time = 2.0  # Minimum time between vehicles in conflict zone
         
@@ -628,6 +812,33 @@ class IntersectionSimulation:
         self._dirs = None
         self._half_exts = None
         self._priorities = None
+        
+        # Pre-allocated tensors for performance (avoid repeated GPU allocations)
+        self._preallocated_tensors = {
+            'positions': torch.zeros((max_vehicles, 2), device=device, dtype=torch.float32),
+            'velocities': torch.zeros(max_vehicles, device=device, dtype=torch.float32),
+            'directions': torch.zeros((max_vehicles, 2), device=device, dtype=torch.float32),
+            'half_extents': torch.zeros((max_vehicles, 2), device=device, dtype=torch.float32),
+            'priorities': torch.zeros(max_vehicles, device=device, dtype=torch.float32),
+            'optimal_accels': torch.zeros(max_vehicles, device=device, dtype=torch.float32),
+            'safe_accels': torch.zeros(max_vehicles, device=device, dtype=torch.float32),
+            'xyv0': torch.zeros((max_vehicles, 3), device=device, dtype=torch.float32),
+            'target_velocities': torch.zeros(max_vehicles, device=device, dtype=torch.float32),
+        }
+        
+        # Object pooling for vehicle management
+        self._vehicle_pool = []
+        self._pool_size = max_vehicles * 2  # Pool twice the max for efficiency
+        
+        # Visualization optimization - reduce update frequency
+        self._viz_update_counter = 0
+        self._distance_calc_cache = float('inf')
+        self._last_distance_calc_step = 0
+        
+        # Spatial partitioning for collision detection optimization
+        self._grid_size = 20.0  # Grid cell size in meters
+        self._spatial_grid = {}  # Dict of {(grid_x, grid_y): [vehicle_ids]}
+        self._vehicle_grid_pos = {}  # Dict of {vehicle_id: (grid_x, grid_y)}
     
     def add_vehicle(self, vehicle: VehicleState):
         """Add vehicle with proper lane positioning"""
@@ -683,6 +894,62 @@ class IntersectionSimulation:
             
             self._priorities = torch.tensor([v.priority for v in self.vehicles], 
                                          device=device, dtype=torch.float32)
+    
+    def _get_grid_pos(self, x: float, y: float) -> Tuple[int, int]:
+        """Get grid position for spatial partitioning"""
+        return (int(x // self._grid_size), int(y // self._grid_size))
+    
+    def _update_spatial_grid(self):
+        """Update spatial partitioning grid for collision detection optimization"""
+        # Clear old grid
+        self._spatial_grid.clear()
+        
+        # Add vehicles to grid
+        for vehicle in self.vehicles:
+            grid_pos = self._get_grid_pos(vehicle.x, vehicle.y)
+            
+            # Update vehicle's grid position
+            old_pos = self._vehicle_grid_pos.get(vehicle.id)
+            if old_pos != grid_pos:
+                self._vehicle_grid_pos[vehicle.id] = grid_pos
+            
+            # Add to grid
+            if grid_pos not in self._spatial_grid:
+                self._spatial_grid[grid_pos] = []
+            self._spatial_grid[grid_pos].append(vehicle.id)
+    
+    def _get_nearby_vehicles(self, vehicle: VehicleState) -> List[VehicleState]:
+        """Get vehicles in nearby grid cells for collision checking"""
+        grid_x, grid_y = self._get_grid_pos(vehicle.x, vehicle.y)
+        nearby_vehicles = []
+        
+        # Check 3x3 grid around vehicle
+        for dx in [-1, 0, 1]:
+            for dy in [-1, 0, 1]:
+                check_pos = (grid_x + dx, grid_y + dy)
+                if check_pos in self._spatial_grid:
+                    for vid in self._spatial_grid[check_pos]:
+                        if vid != vehicle.id:
+                            # Find vehicle by id
+                            for v in self.vehicles:
+                                if v.id == vid:
+                                    nearby_vehicles.append(v)
+                                    break
+        return nearby_vehicles
+    
+    def _get_pooled_vehicle(self) -> Optional[VehicleState]:
+        """Get a vehicle from the object pool or create new one"""
+        if self._vehicle_pool:
+            return self._vehicle_pool.pop()
+        return None
+    
+    def _return_to_pool(self, vehicle: VehicleState):
+        """Return vehicle to object pool for reuse"""
+        if len(self._vehicle_pool) < self._pool_size:
+            # Reset vehicle state for reuse
+            vehicle.velocity = 0.0
+            vehicle.planned_trajectory = None
+            self._vehicle_pool.append(vehicle)
     
     def _precompute_car_template(self, vehicle: VehicleState):
         """Pre-compute rotated car shape template for performance"""
@@ -830,6 +1097,10 @@ class IntersectionSimulation:
         
         for vehicle in vehicles_to_remove:
             self.vehicles.remove(vehicle)
+            
+            # Return vehicle to object pool for reuse
+            self._return_to_pool(vehicle)
+            
             # Clean up visualization elements
             if vehicle.id in self.vehicle_shapes:
                 self.vehicle_shapes[vehicle.id].remove()
@@ -851,8 +1122,14 @@ class IntersectionSimulation:
                 del self._inside_box_prev[vehicle.id]
             if vehicle.id in self._has_completed:
                 del self._has_completed[vehicle.id]
+            # Clean up spatial grid tracking
+            if vehicle.id in self._vehicle_grid_pos:
+                del self._vehicle_grid_pos[vehicle.id]
+            # Clean up reservation system
+            zone = self.conflict_zones['center']
+            zone['active_reservations'].discard(vehicle.id)
             
-            print(f"Removed vehicle {vehicle.id} (distance: {distance_from_center:.1f}m)")
+            print(f"Removed vehicle {vehicle.id} (distance: {max(abs(vehicle.x), abs(vehicle.y)):.1f}m)")
         
         # Invalidate cached tensors when vehicle roster changes
         if vehicles_to_remove:
@@ -881,15 +1158,29 @@ class IntersectionSimulation:
         target_velocity = random.uniform(18.0, 22.0)
         priority = random.uniform(0.1, 0.9)
         
-        new_vehicle = VehicleState(
-            id=self.next_vehicle_id,
-            position=position,
-            velocity=velocity,
-            target_velocity=target_velocity,
-            approach_angle=approach_angle,
-            lane=0,
-            priority=priority
-        )
+        # Try to get vehicle from object pool first
+        new_vehicle = self._get_pooled_vehicle()
+        if new_vehicle is not None:
+            # Reuse pooled vehicle - update properties
+            new_vehicle.id = self.next_vehicle_id
+            new_vehicle.position = position.copy()  # Make sure it's a copy
+            new_vehicle.velocity = velocity
+            new_vehicle.target_velocity = target_velocity
+            new_vehicle.approach_angle = approach_angle
+            new_vehicle.lane = 0
+            new_vehicle.priority = priority
+            # Don't set x, y directly - they're computed from position
+        else:
+            # Create new vehicle if pool is empty
+            new_vehicle = VehicleState(
+                id=self.next_vehicle_id,
+                position=position,
+                velocity=velocity,
+                target_velocity=target_velocity,
+                approach_angle=approach_angle,
+                lane=0,
+                priority=priority
+            )
         
         self.add_vehicle(new_vehicle)
         self.next_vehicle_id += 1
@@ -934,15 +1225,28 @@ class IntersectionSimulation:
                             self.spawn_new_vehicle(approach_angle)
 
     def check_visual_collisions_realtime(self):
-        """Real-time collision detection matching visual representation"""
+        """Real-time collision detection matching visual representation - optimized with spatial partitioning"""
         if len(self.vehicles) < 2:
             return False, []
         
-        visual_collisions = []
+        # Update spatial grid for optimized collision detection
+        self._update_spatial_grid()
         
-        for i in range(len(self.vehicles)):
-            for j in range(i + 1, len(self.vehicles)):
-                vi, vj = self.vehicles[i], self.vehicles[j]
+        visual_collisions = []
+        checked_pairs = set()  # Avoid duplicate checks
+        
+        for vehicle in self.vehicles:
+            # Only check nearby vehicles instead of all vehicles
+            nearby_vehicles = self._get_nearby_vehicles(vehicle)
+            
+            for other_vehicle in nearby_vehicles:
+                # Avoid duplicate pair checks
+                pair = tuple(sorted([vehicle.id, other_vehicle.id]))
+                if pair in checked_pairs:
+                    continue
+                checked_pairs.add(pair)
+                
+                vi, vj = vehicle, other_vehicle
                 
                 # Use same dimensions as visual shapes
                 # Get current half-extents (not predictive)
@@ -1040,13 +1344,18 @@ class IntersectionSimulation:
         return t_min, t_max
 
     def update_intersection_schedule(self):
-        """Intersection scheduling with acceleration-bounded arrival windows"""
+        """Intersection scheduling with acceleration-bounded arrival windows - optimized with heap"""
         current_time = self.current_step * self.dt
         
-        # Clean up old reservations
+        # Clean up old reservations using heap - O(log n) instead of O(n)
         for zone in self.conflict_zones.values():
-            zone['reservations'] = [(vid, start, end) for vid, start, end in zone['reservations'] 
-                                  if end > current_time]
+            heap = zone['reservations_heap']
+            active = zone['active_reservations']
+            
+            # Remove expired reservations from heap top
+            while heap and heap[0][0] <= current_time:  # end_time <= current_time
+                _, vehicle_id, _ = heapq.heappop(heap)
+                active.discard(vehicle_id)
         
         # Check which vehicles need reservations
         for vehicle in self.vehicles:
@@ -1068,22 +1377,23 @@ class IntersectionSimulation:
                 v_exit = max(vehicle.velocity, 0.5)
                 exit_time = current_time + t_latest + self.intersection_size / v_exit + self.headway_time
                 
-                # Check if window is available
+                # Check if window is available using optimized heap structure
                 zone = self.conflict_zones['center']
-                conflict = False
-                for other_id, start, end in zone['reservations']:
-                    if other_id != vehicle.id and not (exit_time <= start or arrival_time >= end):
-                        conflict = True
-                        break
-                
-                # Reserve window if available
-                if not conflict:
-                    # Remove any existing reservation for this vehicle
-                    zone['reservations'] = [(vid, start, end) for vid, start, end in zone['reservations'] 
-                                          if vid != vehicle.id]
-                    # Add new reservation
-                    zone['reservations'].append((vehicle.id, arrival_time, exit_time))
-                    zone['reservations'].sort(key=lambda x: x[1])  # Sort by arrival time
+                if vehicle.id not in zone['active_reservations']:
+                    # Check for conflicts with active reservations - O(k) where k is active reservations
+                    conflict = False
+                    for end_time, other_id, start_time in zone['reservations_heap']:
+                        if (other_id != vehicle.id and 
+                            end_time > current_time and  # Still active
+                            not (exit_time <= start_time or arrival_time >= end_time)):
+                            conflict = True
+                            break
+                    
+                    # Reserve window if available
+                    if not conflict:
+                        # Add new reservation to heap - O(log n)
+                        heapq.heappush(zone['reservations_heap'], (exit_time, vehicle.id, arrival_time))
+                        zone['active_reservations'].add(vehicle.id)
     
     def _axis_proj(self, vehicle, ego_angle):
         """Get 1D projection for ego axis to avoid coordinate confusion"""
@@ -1233,18 +1543,22 @@ class IntersectionSimulation:
         # Update cached tensors if needed
         self._update_cached_tensors()
         
-        # Solve MPC for all vehicles - performance optimization
+        # Solve MPC for all vehicles - performance optimization with pre-allocated tensors
         zone = self.conflict_zones['center']
         now = self.current_step * self.dt
         H_soon = 1.0  # match the ~1s "soon" horizon used in compute_costs_batch
-        reserved_ids = {
-            vid for (vid, start, end) in zone['reservations']
-            if not (end <= now or start >= now + H_soon)   # overlaps [now, now+H_soon]
-        }
-        optimal_accels_list = self.controller.solve_batch_mpc(self.vehicles, self.current_step, reserved_ids=reserved_ids, cached_dirs=self._dirs, cached_half_exts=self._half_exts, cached_priorities=self._priorities)
         
-        # Convert to tensor and keep on GPU for CBF filtering
-        optimal_accels = torch.tensor(optimal_accels_list, device=device, dtype=torch.float32)
+        # Use optimized reservation system - O(1) lookup instead of O(n)
+        reserved_ids = zone['active_reservations'].copy()
+        
+        optimal_accels_list = self.controller.solve_batch_mpc(self.vehicles, self.current_step, reserved_ids=reserved_ids, cached_dirs=self._dirs, cached_half_exts=self._half_exts, cached_priorities=self._priorities, preallocated_tensors=self._preallocated_tensors)
+        
+        # Use pre-allocated tensor instead of creating new one
+        batch_size = len(self.vehicles)
+        optimal_accels = self._preallocated_tensors['optimal_accels'][:batch_size]
+        # Avoid creating intermediate tensor - copy directly from list
+        for i, accel in enumerate(optimal_accels_list):
+            optimal_accels[i] = accel
         
         # Track metrics (event-based, pre-motion)
         if self.vehicles:
@@ -1256,8 +1570,9 @@ class IntersectionSimulation:
                         self.metrics['unreserved_attempts'] += 1
                 self._inside_box_prev[veh.id] = inside_now
         
-        # Apply CBF safety filter - stays on GPU, no sync!
-        safe_accels = self.cbf_clip_batch(optimal_accels)
+        # Apply CBF safety filter using pre-allocated tensor - stays on GPU, no sync!
+        safe_accels = self._preallocated_tensors['safe_accels'][:batch_size]
+        safe_accels.copy_(self.cbf_clip_batch(optimal_accels))
         
         # Single CPU transfer only when we need to update Python objects
         safe_accels_cpu = safe_accels.cpu().tolist()
@@ -1503,18 +1818,24 @@ class IntersectionSimulation:
             self.vehicle_shapes[vehicle.id].set_xy(car_points)
             updated_artists.append(self.vehicle_shapes[vehicle.id])
             
-            # Update trail with reduced history for performance
-            hist_len = len(self.history_x[vehicle.id])
-            if hist_len > 1:
-                # Use fewer trail points for better performance
-                trail_points = min(10, hist_len)  # Reduced from 25 to 10
-                trail_data_x = list(self.history_x[vehicle.id])[-trail_points:]
-                trail_data_y = list(self.history_y[vehicle.id])[-trail_points:]
-                self.vehicle_trails[vehicle.id].set_data(trail_data_x, trail_data_y)
-                updated_artists.append(self.vehicle_trails[vehicle.id])
+            # Update trail with reduced history for performance - only every few frames
+            if frame % 3 == 0:  # Update trails every 3rd frame
+                hist_len = len(self.history_x[vehicle.id])
+                if hist_len > 1:
+                    # Use fewer trail points for better performance and avoid list conversion
+                    trail_points = min(8, hist_len)  # Reduced further from 10 to 8
+                    # Direct slice from deque without conversion to list
+                    history_x = self.history_x[vehicle.id]
+                    history_y = self.history_y[vehicle.id]
+                    if len(history_x) >= trail_points:
+                        trail_data_x = list(history_x)[-trail_points:]
+                        trail_data_y = list(history_y)[-trail_points:]
+                        self.vehicle_trails[vehicle.id].set_data(trail_data_x, trail_data_y)
+                        updated_artists.append(self.vehicle_trails[vehicle.id])
             
             # Update speed plot less frequently for better performance
             if frame % 5 == 0:  # Update every 5th frame instead of 2nd
+                hist_len = len(self.history_v[vehicle.id])
                 times = [i * self.dt for i in range(hist_len)]
                 if times and self.history_v[vehicle.id]:  # Ensure data exists
                     speed_data = list(self.history_v[vehicle.id])
@@ -1539,26 +1860,49 @@ class IntersectionSimulation:
             self._update_metrics_display(frame)
             updated_artists.append(self.metrics_text)
             
-        # Auto-extend speed plot x-axis more frequently
-        if frame % 5 == 0 and self.vehicles:  # Every 5th frame
-            max_time = max(len(self.history_v[v.id]) * self.dt for v in self.vehicles if self.history_v[v.id])
-            if max_time > self.ax_speed.get_xlim()[1]:
-                self.ax_speed.set_xlim(0, max_time + 5)
-            
-            # Also update y-axis to fit all speeds
-            all_speeds = []
-            for v in self.vehicles:
-                if self.history_v[v.id]:
-                    all_speeds.extend(self.history_v[v.id])
-            
-            if all_speeds:
-                max_speed = max(all_speeds)
-                if max_speed > self.ax_speed.get_ylim()[1]:
-                    self.ax_speed.set_ylim(0, max_speed + 2)
-            
-            # Force redraw of speed plot
-            self.ax_speed.relim()
-            self.ax_speed.autoscale_view(scalex=True, scaley=True)
+        # CRITICAL: Avoid expensive axis operations during animation per matplotlib best practices
+        # Auto-extend speed plot axes VERY infrequently to avoid performance hits
+        if frame % 100 == 0 and self.vehicles:  # Every 100th frame (very infrequent)
+            try:
+                # Cache calculations to minimize computation
+                if not hasattr(self, '_cached_max_time') or frame % 200 == 0:
+                    max_time = 0
+                    for v in self.vehicles:
+                        if self.history_v[v.id]:
+                            max_time = max(max_time, len(self.history_v[v.id]) * self.dt)
+                    self._cached_max_time = max_time
+                
+                # Only update if really necessary - batch axis updates
+                current_xlim = self.ax_speed.get_xlim()[1]
+                current_ylim = self.ax_speed.get_ylim()[1]
+                needs_update = False
+                
+                if self._cached_max_time > current_xlim:
+                    new_xlim = self._cached_max_time + 10  # More buffer
+                    needs_update = True
+                else:
+                    new_xlim = current_xlim
+                
+                # Cache max speed calculation
+                if not hasattr(self, '_cached_max_speed') or frame % 200 == 0:
+                    max_speed = 0
+                    for v in self.vehicles:
+                        if self.history_v[v.id] and len(self.history_v[v.id]) > 0:
+                            max_speed = max(max_speed, max(self.history_v[v.id]))
+                    self._cached_max_speed = max_speed
+                
+                if self._cached_max_speed > current_ylim:
+                    new_ylim = self._cached_max_speed + 5  # More buffer
+                    needs_update = True
+                else:
+                    new_ylim = current_ylim
+                
+                # Batch update both axes at once to minimize draw calls
+                if needs_update:
+                    self.ax_speed.set_xlim(0, new_xlim)
+                    self.ax_speed.set_ylim(0, new_ylim)
+            except Exception:
+                pass  # Ignore errors to prevent animation crashes
         
         # Return all artists that need updating
         return (list(self.vehicle_shapes.values()) + 
@@ -1576,15 +1920,18 @@ class IntersectionSimulation:
         max_speed = max(current_speeds)
         avg_speed = np.mean(current_speeds)
         
-        # Minimum distance calculation (expensive, do less frequently)
-        if len(self.vehicles) > 1:
-            positions = np.array([[v.x, v.y] for v in self.vehicles])
-            pos_diff = positions[:, np.newaxis, :] - positions[np.newaxis, :, :]
-            distances = np.linalg.norm(pos_diff, axis=2)
-            distances[distances == 0] = np.inf
-            min_distance = np.min(distances)
-        else:
-            min_distance = float('inf')
+        # Minimum distance calculation (expensive, cache and do less frequently)
+        if (self.current_step - self._last_distance_calc_step) >= 10:  # Update every 10 steps
+            if len(self.vehicles) > 1:
+                positions = np.array([[v.x, v.y] for v in self.vehicles])
+                pos_diff = positions[:, np.newaxis, :] - positions[np.newaxis, :, :]
+                distances = np.linalg.norm(pos_diff, axis=2)
+                distances[distances == 0] = np.inf
+                self._distance_calc_cache = np.min(distances)
+                self._last_distance_calc_step = self.current_step
+            else:
+                self._distance_calc_cache = float('inf')
+        min_distance = self._distance_calc_cache
         
         # Count vehicles in car-following mode
         following_count = 0
@@ -1632,23 +1979,50 @@ class IntersectionSimulation:
             self.plot_initialized = True
     
     def init_animation(self):
-        """Initialize function for matplotlib blitting - required for proper animation"""
-        # Return all animated artists that need to be redrawn
+        """Initialize function for matplotlib blitting - required for proper animation performance"""
+        # Clear line artists (trails, speed lines, predicted paths)
+        for artist_dict in [self.vehicle_trails, self.speed_lines, self.predicted_paths]:
+            for artist in artist_dict.values():
+                if hasattr(artist, 'set_data'):
+                    artist.set_data([], [])
+        
+        # For polygon shapes, we can't easily clear them without recreating
+        # So we'll leave them as-is for the initial state
+        
+        # Set metrics to empty
+        if hasattr(self, 'metrics_text'):
+            self.metrics_text.set_text('')
+        
+        # Return all animated artists - matplotlib will set them as animated automatically
         artists = []
         artists.extend(self.vehicle_shapes.values())
         artists.extend(self.vehicle_trails.values())
         artists.extend(self.speed_lines.values())
         artists.extend(self.predicted_paths.values())
-        artists.append(self.metrics_text)
+        if hasattr(self, 'metrics_text'):
+            artists.append(self.metrics_text)
         return artists
     
     def run_animation(self):
         self.finalize_setup()
-        # Enable blitting for better performance with proper init_func
-        ani = animation.FuncAnimation(self.fig, self.animate, frames=None,  # Infinite frames
-                                    init_func=self.init_animation,  # Required for blitting
-                                    interval=33, blit=True, repeat=True,  # Allow repeat
-                                    cache_frame_data=False)  # Reduce memory usage
+        
+        # Apply matplotlib performance optimizations from documentation
+        import matplotlib.style as mplstyle
+        if 'fast' not in plt.rcParams or not mplstyle.library['fast']:
+            mplstyle.use('fast')  # Enable performance optimizations
+        
+        # Configure optimal animation parameters following matplotlib best practices
+        ani = animation.FuncAnimation(
+            self.fig, self.animate, 
+            frames=None,  # Infinite frames
+            init_func=self.init_animation,  # Required for blitting performance
+            interval=33,  # ~30 FPS (1000ms/30)
+            blit=True,  # Critical for performance - only redraw changed artists
+            repeat=True,  # Allow animation to repeat
+            cache_frame_data=False,  # Reduce memory usage as recommended
+            save_count=1  # Minimize memory usage for infinite animation
+        )
+        
         plt.tight_layout()
         plt.show(block=True)  # Block to keep window open
         return ani
@@ -1722,6 +2096,91 @@ class IntersectionSimulation:
             # Clamp to absolute physical limits as final safety check
             result = torch.clamp(result, -6.0, 3.0)  # max_decel=6.0, max_accel=3.0
             return result
+    
+    def collect_training_data(self, steps: int = 1000):
+        """Run simulation to collect training data"""
+        if not self.training_mode:
+            print("Training mode not enabled! Create simulation with training_mode=True")
+            return
+            
+        print(f"Collecting training data for {steps} steps...")
+        
+        for step in range(steps):
+            # Update simulation 
+            self.simulate_step()
+            
+            if step % 100 == 0:
+                collected = self.controller.data_collector.sample_count
+                print(f"Step {step}, Collected samples: {collected}")
+        
+        collected = self.controller.data_collector.sample_count
+        print(f"Data collection complete. Total samples: {collected}")
+    
+    def train_model(self, epochs: int = 50):
+        """Train the neural network using collected data"""
+        if not self.training_mode or self.trainer is None:
+            print("Training mode not enabled!")
+            return
+            
+        if self.controller.data_collector.sample_count == 0:
+            print("No training data collected! Run collect_training_data() first.")
+            return
+            
+        return self.trainer.train_from_data_collector(self.controller.data_collector, epochs)
+    
+    def save_trained_model(self, filepath: str = "trained_neural_mpc.pth"):
+        """Save the trained model"""
+        if self.trainer is not None:
+            self.trainer.save_model(filepath)
+        else:
+            print("No trainer available!")
+    
+    def load_trained_model(self, filepath: str = "trained_neural_mpc.pth"):
+        """Load a trained model"""
+        if self.trainer is not None:
+            self.trainer.load_model(filepath)
+        else:
+            # Load model directly without trainer
+            import os
+            if os.path.exists(filepath):
+                checkpoint = torch.load(filepath, map_location=device)
+                self.controller.neural_mpc.load_state_dict(checkpoint['model_state_dict'])
+                print(f"Model loaded from {filepath}")
+            else:
+                raise FileNotFoundError(f"Model file {filepath} not found")
+
+
+def create_training_scenario(device_override=None):
+    """Create scenario for training data collection"""
+    global device
+    if device_override:
+        device = device_override
+    sim = IntersectionSimulation(max_vehicles=16, training_mode=True)
+    
+    # Use same vehicle setup as regular scenario
+    vehicles = [
+        VehicleState(1, np.array([-80.0, 0.0]), 12.0, 20.0, 0, 0, 0.8),
+        VehicleState(2, np.array([-120.0, 0.0]), 11.0, 20.0, 0, 0, 0.6),
+        VehicleState(3, np.array([-160.0, 0.0]), 10.0, 20.0, 0, 0, 0.4),
+        VehicleState(4, np.array([-200.0, 0.0]), 9.0, 20.0, 0, 0, 0.7),
+        VehicleState(5, np.array([85.0, 0.0]), 13.0, 20.0, 180, 0, 0.7),
+        VehicleState(6, np.array([125.0, 0.0]), 12.0, 20.0, 180, 0, 0.5),
+        VehicleState(7, np.array([165.0, 0.0]), 11.0, 20.0, 180, 0, 0.3),
+        VehicleState(8, np.array([205.0, 0.0]), 10.0, 20.0, 180, 0, 0.6),
+        VehicleState(9, np.array([0.0, -75.0]), 10.0, 20.0, 90, 0, 0.9),
+        VehicleState(10, np.array([0.0, -115.0]), 11.0, 20.0, 90, 0, 0.4),
+        VehicleState(11, np.array([0.0, -155.0]), 12.0, 20.0, 90, 0, 0.8),
+        VehicleState(12, np.array([0.0, -195.0]), 9.0, 20.0, 90, 0, 0.5),
+        VehicleState(13, np.array([0.0, 80.0]), 9.0, 20.0, 270, 0, 0.3),
+        VehicleState(14, np.array([0.0, 120.0]), 10.0, 20.0, 270, 0, 0.2),
+        VehicleState(15, np.array([0.0, 160.0]), 11.0, 20.0, 270, 0, 0.6),
+        VehicleState(16, np.array([0.0, 200.0]), 8.0, 20.0, 270, 0, 0.9),
+    ]
+    
+    for vehicle in vehicles:
+        sim.add_vehicle(vehicle)
+    
+    return sim
 
 
 def create_scenario(device_override=None):
@@ -1757,40 +2216,96 @@ def create_scenario(device_override=None):
     return sim
 
 
-if __name__ == "__main__":
-    print("High-Performance Intersection Control")
+def train_neural_mpc():
+    """Training script for the neural MPC controller"""
+    print("Neural MPC Training Mode")
     
-    # Update device selection based on actual workload
-    max_vehicles = 16  # From create_scenario - doubled
+    # Force GPU usage for training if available
+    max_vehicles = 16
     horizon = 15
-    device = pick_device(max_vehicles, horizon)
-    print(f"Device selected: {device} (workload: {max_vehicles}×{horizon}={max_vehicles*horizon})")
-    
-    print("Features:")
-    print("  - Predictive Collision Avoidance")
-    print("  - Priority-Based Coordination")
-    print("  - Batched GPU processing")
-    print("  - Vectorized operations")
-    print("  - Optimal data structures")
-    print("  - Clean architecture")
-    print("  - GPU-resident CBF safety filter")
-    print("  - Branchless gradient clipping")
-    print("  - Vectorized cost computation")
-    print("\nStarting simulation...")
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+        print(f"Device selected: {device} (forced GPU for training)")
+    else:
+        device = pick_device(max_vehicles, horizon)
+        print(f"Device selected: {device} (no GPU available)")
     
     try:
-        sim = create_scenario(device_override=device)
-        animation_object = sim.run_animation()
+        # Create training scenario
+        print("Creating training scenario...")
+        sim = create_training_scenario(device_override=device)
         
-        # Keep the program running to display animation
-        input("\nPress Enter to exit...")
+        # Collect training data
+        print("Collecting training data...")
+        sim.collect_training_data(steps=5000)  # More data for better model
+        
+        # Train the model
+        print("Training neural network...")
+        losses = sim.train_model(epochs=150)  # Extended training
+        
+        # Save the trained model
+        print("Saving trained model...")
+        sim.save_trained_model("trained_neural_mpc.pth")
+        
+        print("Training completed successfully!")
         
     except KeyboardInterrupt:
-        print("\nSimulation interrupted by user")
+        print("\nTraining interrupted by user")
     except Exception as e:
         import traceback
-        print(f"\nSimulation error: {e}")
+        print(f"\nTraining error: {e}")
         print(f"Traceback:\n{traceback.format_exc()}")
-    finally:
-        plt.close('all')
-        print("Simulation complete!")
+
+
+if __name__ == "__main__":
+    import sys
+    
+    if len(sys.argv) > 1 and sys.argv[1] == "--train":
+        train_neural_mpc()
+    else:
+        print("High-Performance Intersection Control")
+        
+        # Update device selection based on actual workload
+        max_vehicles = 16  # From create_scenario - doubled
+        horizon = 15
+        device = pick_device(max_vehicles, horizon)
+        print(f"Device selected: {device} (workload: {max_vehicles}×{horizon}={max_vehicles*horizon})")
+        
+        print("Features:")
+        print("  - Predictive Collision Avoidance")
+        print("  - Priority-Based Coordination")
+        print("  - Batched GPU processing")
+        print("  - Vectorized operations")
+        print("  - Optimal data structures")
+        print("  - Clean architecture")  
+        print("  - Neural MPC Controller (trained)")
+        print("  - GPU-resident CBF safety filter")
+        print("  - Branchless gradient clipping")
+        print("  - Vectorized cost computation")
+        print("\nUse --train flag to train the neural network")
+        print("Starting simulation...")
+        
+        try:
+            sim = create_scenario(device_override=device)
+            
+            # Try to load trained model if available
+            try:
+                sim.load_trained_model("trained_neural_mpc.pth")
+                print("Loaded trained neural MPC model!")
+            except:
+                print("No trained model found, using untrained network")
+            
+            animation_object = sim.run_animation()
+            
+            # Keep the program running to display animation
+            input("\nPress Enter to exit...")
+            
+        except KeyboardInterrupt:
+            print("\nSimulation interrupted by user")
+        except Exception as e:
+            import traceback
+            print(f"\nSimulation error: {e}")
+            print(f"Traceback:\n{traceback.format_exc()}")
+        finally:
+            plt.close('all')
+            print("Simulation complete!")
