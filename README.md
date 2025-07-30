@@ -185,11 +185,11 @@ graph TB
     VEHICLE --> UI
     COLLISION --> UI
 
-    classDef presentation fill:#e1f5fe
-    classDef application fill:#f3e5f5
-    classDef domain fill:#e8f5e8
-    classDef infrastructure fill:#fff3e0
-    classDef training fill:#fce4ec
+    classDef presentation fill:#1e3a8a,stroke:#3b82f6,stroke-width:2px,color:#ffffff
+    classDef application fill:#7c2d12,stroke:#f97316,stroke-width:2px,color:#ffffff
+    classDef domain fill:#14532d,stroke:#22c55e,stroke-width:2px,color:#ffffff
+    classDef infrastructure fill:#451a03,stroke:#f59e0b,stroke-width:2px,color:#ffffff
+    classDef training fill:#831843,stroke:#ec4899,stroke-width:2px,color:#ffffff
 
     class UI,ANIM,METRICS presentation
     class SIM,COORD,SPAWN application
