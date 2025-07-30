@@ -1,4 +1,4 @@
-# Autonomous Vehicle Traffic Simulation (proto.py)
+# Autonomous Vehicle Traffic Simulation
 
 A high-performance traffic intersection simulation that tests the hypothesis: **Can autonomous vehicles eliminate traffic lights through coordination?**
 
